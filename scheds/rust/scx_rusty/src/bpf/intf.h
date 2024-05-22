@@ -17,6 +17,7 @@
 typedef unsigned char u8;
 typedef unsigned int u32;
 typedef unsigned long long u64;
+typedef long long s64;
 #endif
 
 #include <scx/ravg.bpf.h>
@@ -43,12 +44,10 @@ enum consts {
 	NSEC_PER_SEC            = NSEC_PER_USEC * USEC_PER_SEC,
 
 	/* Constants used for determining a task's deadline */
-	DL_RUNTIME_SCALE	= 2, /* roughly scales average runtime to */
-				     /* same order of magnitude as waker  */
-				     /* and blocked frequencies */
-	DL_MAX_LATENCY_NS	= (50 * NSEC_PER_MSEC),
+	DL_RUNTIME_FACTOR	= 100,
 	DL_FREQ_FT_MAX		= 100000,
 	DL_MAX_LAT_PRIO		= 39,
+	DL_FULL_DCYCLE		= 650000,
 
 	/*
 	 * When userspace load balancer is trying to determine the tasks to push
