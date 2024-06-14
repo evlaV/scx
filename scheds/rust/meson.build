@@ -14,12 +14,11 @@ sched = []
 #                       ...
 #                       depends: [mydep, sched],
 #                       build_always_stale: true)
-subdir('scx_layered')
-#subdir('scx_mitosis') # Temporarily excluded until cgroup support lands in the kernel
-subdir('scx_rusty')
-subdir('scx_rustland')
-subdir('scx_rlfifo')
-subdir('scx_bpfland')
+# subdir('scx_layered')
+# subdir('scx_mitosis')
+# subdir('scx_rusty')
+# subdir('scx_rustland')
+# subdir('scx_rlfifo')
 subdir('scx_lavd')
 
 # the target to compile all rust schedulers
