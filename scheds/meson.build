@@ -11,4 +11,4 @@ user_c_includes = include_directories('include')
 if get_option('enable_rust')
   subdir('rust')
 endif
-subdir('c')
+# subdir('c')
