@@ -1,0 +1,50 @@
+error[E0277]: the trait bound `Vec<usize>: RegexRepresentation` is not satisfied
+  --> tests/fail/nightly/missing_trait_regex.rs:10:33
+   |
+10 |     sscanf::sscanf!("hi", "{}", std::vec::Vec<usize>);
+   |                                 ^^^^^^^^^^^^^^^^^^^^ the trait `RegexRepresentation` is not implemented for `Vec<usize>`
+   |
+   = help: the following other types implement trait `RegexRepresentation`:
+             FullF32
+             FullF64
+             HexNumber
+             NonZeroI128
+             NonZeroI16
+             NonZeroI32
+             NonZeroI64
+             NonZeroI8
+           and $N others
+
+error[E0277]: the trait bound `NoRegex: RegexRepresentation` is not satisfied
+  --> tests/fail/nightly/missing_trait_regex.rs:11:33
+   |
+11 |     sscanf::sscanf!("hi", "{}", NoRegex);
+   |                                 ^^^^^^^ the trait `RegexRepresentation` is not implemented for `NoRegex`
+   |
+   = help: the following other types implement trait `RegexRepresentation`:
+             FullF32
+             FullF64
+             HexNumber
+             NonZeroI128
+             NonZeroI16
+             NonZeroI32
+             NonZeroI64
+             NonZeroI8
+           and $N others
+
+error[E0277]: the trait bound `&[u8]: RegexRepresentation` is not satisfied
+  --> tests/fail/nightly/missing_trait_regex.rs:19:47
+   |
+19 | struct TestMapParamNoScanf(#[sscanf(map = |x: &[u8]| { x[0] })] u8);
+   |                                               ^^^^^ the trait `RegexRepresentation` is not implemented for `&[u8]`
+   |
+   = help: the following other types implement trait `RegexRepresentation`:
+             FullF32
+             FullF64
+             HexNumber
+             NonZeroI128
+             NonZeroI16
+             NonZeroI32
+             NonZeroI64
+             NonZeroI8
+           and $N others
