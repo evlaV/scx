@@ -3,8 +3,7 @@
 extern crate num_traits;
 extern crate ordered_float;
 
-#[cfg(not(feature = "std"))]
-pub use num_traits::float::FloatCore as Float;
+pub use num_traits::float::FloatCore;
 pub use num_traits::{Bounded, FloatConst, FromPrimitive, Num, One, Signed, ToPrimitive, Zero};
 #[cfg(feature = "std")]
 pub use num_traits::{Float, Pow};
@@ -18,7 +17,7 @@ pub use std::collections::hash_map::RandomState;
 pub use std::collections::HashSet;
 pub use std::hash::*;
 
-fn not_nan<T: Float>(x: T) -> NotNan<T> {
+fn not_nan<T: FloatCore>(x: T) -> NotNan<T> {
     NotNan::new(x).unwrap()
 }
 
@@ -68,9 +67,9 @@ fn ordered_f32_compare_regular_floats_op() {
 
 #[test]
 fn ordered_f32_compare_nan() {
-    let f32_nan: f32 = Float::nan();
+    let f32_nan: f32 = FloatCore::nan();
     assert_eq!(
-        OrderedFloat(f32_nan).cmp(&OrderedFloat(Float::nan())),
+        OrderedFloat(f32_nan).cmp(&OrderedFloat(FloatCore::nan())),
         Equal
     );
     assert_eq!(
@@ -78,14 +77,14 @@ fn ordered_f32_compare_nan() {
         Greater
     );
     assert_eq!(
-        OrderedFloat(-100.0f32).cmp(&OrderedFloat(Float::nan())),
+        OrderedFloat(-100.0f32).cmp(&OrderedFloat(FloatCore::nan())),
         Less
     );
 }
 
 #[test]
 fn ordered_f32_compare_nan_op() {
-    let f32_nan: OrderedFloat<f32> = OrderedFloat(Float::nan());
+    let f32_nan: OrderedFloat<f32> = OrderedFloat(FloatCore::nan());
     assert!(f32_nan == f32_nan);
     assert!(f32_nan <= f32_nan);
     assert!(f32_nan >= f32_nan);
@@ -93,10 +92,10 @@ fn ordered_f32_compare_nan_op() {
     assert!(f32_nan >= OrderedFloat(-100000.0f32));
     assert!(OrderedFloat(-100.0f32) < f32_nan);
     assert!(OrderedFloat(-100.0f32) <= f32_nan);
-    assert!(f32_nan > OrderedFloat(f32::infinity()));
-    assert!(f32_nan >= OrderedFloat(f32::infinity()));
-    assert!(f32_nan > OrderedFloat(f32::neg_infinity()));
-    assert!(f32_nan >= OrderedFloat(f32::neg_infinity()));
+    assert!(f32_nan > OrderedFloat(<f32 as FloatCore>::infinity()));
+    assert!(f32_nan >= OrderedFloat(<f32 as FloatCore>::infinity()));
+    assert!(f32_nan > OrderedFloat(<f32 as FloatCore>::neg_infinity()));
+    assert!(f32_nan >= OrderedFloat(<f32 as FloatCore>::neg_infinity()));
 }
 
 #[test]
@@ -104,6 +103,15 @@ fn ordered_f64_compare_regular_floats() {
     assert_eq!(OrderedFloat(7.0f64).cmp(&OrderedFloat(7.0)), Equal);
     assert_eq!(OrderedFloat(8.0f64).cmp(&OrderedFloat(7.0)), Greater);
     assert_eq!(OrderedFloat(4.0f64).cmp(&OrderedFloat(7.0)), Less);
+}
+
+/// This code is not run, but successfully compiling it checks that the given bounds
+/// are *sufficient* to write code that is generic over float type.
+fn _generic_code_can_use_float_core<T>(inputs: &mut [OrderedFloat<T>])
+where
+    T: num_traits::float::FloatCore,
+{
+    inputs.sort();
 }
 
 #[test]
@@ -139,8 +147,8 @@ fn not_nan32_from_primitive() {
     assert_eq!(NotNan::<f32>::from_f32(42f32), Some(not_nan(42.0)));
     assert_eq!(NotNan::<f32>::from_f64(42f64), Some(not_nan(42.0)));
     assert_eq!(NotNan::<f32>::from_f64(42f64), Some(not_nan(42.0)));
-    assert_eq!(NotNan::<f32>::from_f32(Float::nan()), None);
-    assert_eq!(NotNan::<f32>::from_f64(Float::nan()), None);
+    assert_eq!(NotNan::<f32>::from_f32(FloatCore::nan()), None);
+    assert_eq!(NotNan::<f32>::from_f64(FloatCore::nan()), None);
 }
 
 #[test]
@@ -183,14 +191,17 @@ fn not_nan32_num_cast() {
         <NotNan<f32> as num_traits::NumCast>::from(42).unwrap(),
         42f32
     );
-    assert_eq!(<NotNan<f32> as num_traits::NumCast>::from(f32::nan()), None);
+    assert_eq!(
+        <NotNan<f32> as num_traits::NumCast>::from(<f32 as FloatCore>::nan()),
+        None
+    );
 }
 
 #[test]
 fn ordered_f64_compare_nan() {
-    let f64_nan: f64 = Float::nan();
+    let f64_nan: f64 = FloatCore::nan();
     assert_eq!(
-        OrderedFloat(f64_nan).cmp(&OrderedFloat(Float::nan())),
+        OrderedFloat(f64_nan).cmp(&OrderedFloat(FloatCore::nan())),
         Equal
     );
     assert_eq!(
@@ -198,7 +209,7 @@ fn ordered_f64_compare_nan() {
         Greater
     );
     assert_eq!(
-        OrderedFloat(-100.0f64).cmp(&OrderedFloat(Float::nan())),
+        OrderedFloat(-100.0f64).cmp(&OrderedFloat(FloatCore::nan())),
         Less
     );
 }
@@ -216,7 +227,7 @@ fn ordered_f64_compare_regular_floats_op() {
 
 #[test]
 fn ordered_f64_compare_nan_op() {
-    let f64_nan: OrderedFloat<f64> = OrderedFloat(Float::nan());
+    let f64_nan: OrderedFloat<f64> = OrderedFloat(FloatCore::nan());
     assert!(f64_nan == f64_nan);
     assert!(f64_nan <= f64_nan);
     assert!(f64_nan >= f64_nan);
@@ -224,10 +235,10 @@ fn ordered_f64_compare_nan_op() {
     assert!(f64_nan >= OrderedFloat(-100000.0));
     assert!(OrderedFloat(-100.0) < f64_nan);
     assert!(OrderedFloat(-100.0) <= f64_nan);
-    assert!(f64_nan > OrderedFloat(f64::infinity()));
-    assert!(f64_nan >= OrderedFloat(f64::infinity()));
-    assert!(f64_nan > OrderedFloat(f64::neg_infinity()));
-    assert!(f64_nan >= OrderedFloat(f64::neg_infinity()));
+    assert!(f64_nan > OrderedFloat(<f64 as FloatCore>::infinity()));
+    assert!(f64_nan >= OrderedFloat(<f64 as FloatCore>::infinity()));
+    assert!(f64_nan > OrderedFloat(<f64 as FloatCore>::neg_infinity()));
+    assert!(f64_nan >= OrderedFloat(<f64 as FloatCore>::neg_infinity()));
 }
 
 #[test]
@@ -239,7 +250,7 @@ fn not_nan32_compare_regular_floats() {
 
 #[test]
 fn not_nan32_fail_when_constructing_with_nan() {
-    let f32_nan: f32 = Float::nan();
+    let f32_nan: f32 = FloatCore::nan();
     assert!(NotNan::new(f32_nan).is_err());
 }
 
@@ -323,7 +334,7 @@ fn not_nan64_compare_regular_floats() {
 
 #[test]
 fn not_nan64_fail_when_constructing_with_nan() {
-    let f64_nan: f64 = Float::nan();
+    let f64_nan: f64 = FloatCore::nan();
     assert!(NotNan::new(f64_nan).is_err());
 }
 
@@ -431,8 +442,8 @@ fn not_nan64_from_primitive() {
     assert_eq!(NotNan::<f64>::from_f64(42f64), Some(not_nan(42.0)));
     assert_eq!(NotNan::<f64>::from_f64(42f64), Some(not_nan(42.0)));
     assert_eq!(NotNan::<f64>::from_f64(42f64), Some(not_nan(42.0)));
-    assert_eq!(NotNan::<f64>::from_f64(Float::nan()), None);
-    assert_eq!(NotNan::<f64>::from_f64(Float::nan()), None);
+    assert_eq!(NotNan::<f64>::from_f64(FloatCore::nan()), None);
+    assert_eq!(NotNan::<f64>::from_f64(FloatCore::nan()), None);
 }
 
 #[test]
@@ -478,7 +489,10 @@ fn not_nan64_num_cast() {
         <NotNan<f64> as num_traits::NumCast>::from(42),
         Some(not_nan(42f64))
     );
-    assert_eq!(<NotNan<f64> as num_traits::NumCast>::from(f64::nan()), None);
+    assert_eq!(
+        <NotNan<f64> as num_traits::NumCast>::from(<f64 as FloatCore>::nan()),
+        None
+    );
 }
 
 #[test]
@@ -506,8 +520,8 @@ fn hash_different_nans_to_the_same_hc() {
     let state = RandomState::new();
     let mut h1 = state.build_hasher();
     let mut h2 = state.build_hasher();
-    OrderedFloat::from(f64::nan()).hash(&mut h1);
-    OrderedFloat::from(-f64::nan()).hash(&mut h2);
+    OrderedFloat::from(<f64 as FloatCore>::nan()).hash(&mut h1);
+    OrderedFloat::from(-<f64 as FloatCore>::nan()).hash(&mut h2);
     assert_eq!(h1.finish(), h2.finish());
 }
 

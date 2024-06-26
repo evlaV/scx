@@ -4,18 +4,20 @@ extern crate semver;
 extern crate serde_json;
 
 use camino::Utf8PathBuf;
-use cargo_metadata::{CargoOpt, DependencyKind, Edition, Metadata, MetadataCommand};
+use cargo_metadata::{
+    workspace_default_members_is_missing, ArtifactDebuginfo, CargoOpt, DependencyKind, Edition,
+    Message, Metadata, MetadataCommand,
+};
 
-#[test]
-fn old_minimal() {
-    // Output from oldest supported version (1.24).
-    // This intentionally has as many null fields as possible.
-    // 1.8 is when metadata was introduced.
-    // Older versions not supported because the following are required:
-    // - `workspace_members` added in 1.13
-    // - `target_directory` added in 1.19
-    // - `workspace_root` added in 1.24
-    let json = r#"
+/// Output from oldest version ever supported (1.24).
+///
+/// This intentionally has as many null fields as possible.
+/// 1.8 is when metadata was introduced.
+/// Older versions not supported because the following are required:
+/// - `workspace_members` added in 1.13
+/// - `target_directory` added in 1.19
+/// - `workspace_root` added in 1.24
+const JSON_OLD_MINIMAL: &str = r#"
 {
   "packages": [
     {
@@ -63,7 +65,10 @@ fn old_minimal() {
   "workspace_root": "/foo"
 }
 "#;
-    let meta: Metadata = serde_json::from_str(json).unwrap();
+
+#[test]
+fn old_minimal() {
+    let meta: Metadata = serde_json::from_str(JSON_OLD_MINIMAL).unwrap();
     assert_eq!(meta.packages.len(), 1);
     let pkg = &meta.packages[0];
     assert_eq!(pkg.name, "foo");
@@ -119,6 +124,15 @@ fn old_minimal() {
     assert_eq!(meta.workspace_root, "/foo");
     assert_eq!(meta.workspace_metadata, serde_json::Value::Null);
     assert_eq!(meta.target_directory, "/foo/target");
+
+    assert!(workspace_default_members_is_missing(
+        &meta.workspace_default_members
+    ));
+    let serialized = serde_json::to_value(meta).unwrap();
+    assert!(!serialized
+        .as_object()
+        .unwrap()
+        .contains_key("workspace_default_members"));
 }
 
 macro_rules! sorted {
@@ -176,6 +190,7 @@ fn all_the_fields() {
         // path added in 1.51
         // default_run added in 1.55
         // rust_version added in 1.58
+        // workspace_default_members added in 1.71
         eprintln!("Skipping all_the_fields test, cargo {} is too old.", ver);
         return;
     }
@@ -185,7 +200,7 @@ fn all_the_fields() {
         .unwrap();
     assert_eq!(meta.workspace_root.file_name().unwrap(), "all");
     assert_eq!(
-        serde_json::from_value::<WorkspaceMetadata>(meta.workspace_metadata).unwrap(),
+        serde_json::from_value::<WorkspaceMetadata>(meta.workspace_metadata.clone()).unwrap(),
         WorkspaceMetadata {
             testobject: TestObject {
                 myvalue: "abc".to_string()
@@ -194,6 +209,9 @@ fn all_the_fields() {
     );
     assert_eq!(meta.workspace_members.len(), 1);
     assert!(meta.workspace_members[0].to_string().starts_with("all"));
+    if ver >= semver::Version::parse("1.71.0").unwrap() {
+        assert_eq!(&*meta.workspace_default_members, &meta.workspace_members);
+    }
 
     assert_eq!(meta.packages.len(), 9);
     let all = meta.packages.iter().find(|p| p.name == "all").unwrap();
@@ -210,7 +228,7 @@ fn all_the_fields() {
     if ver >= semver::Version::parse("1.58.0").unwrap() {
         assert_eq!(
             all.rust_version,
-            Some(semver::VersionReq::parse("1.56").unwrap())
+            Some(semver::Version::parse("1.56.0").unwrap())
         );
     }
 
@@ -448,6 +466,18 @@ fn all_the_fields() {
         kind.target.as_ref().map(|x| x.to_string()),
         Some("cfg(windows)".to_string())
     );
+
+    let serialized = serde_json::to_value(meta).unwrap();
+    if ver >= semver::Version::parse("1.71.0").unwrap() {
+        assert!(serialized.as_object().unwrap()["workspace_default_members"]
+            .as_array()
+            .is_some());
+    } else {
+        assert!(!serialized
+            .as_object()
+            .unwrap()
+            .contains_key("workspace_default_members"));
+    }
 }
 
 #[test]
@@ -644,4 +674,54 @@ fn basic_workspace_root_package_exists() {
             .name,
         "ex_bin"
     );
+}
+
+#[test]
+fn debuginfo_variants() {
+    // Checks behavior for the different debuginfo variants.
+    let variants = [
+        ("0", ArtifactDebuginfo::None),
+        ("1", ArtifactDebuginfo::Limited),
+        ("2", ArtifactDebuginfo::Full),
+        (
+            "\"line-directives-only\"",
+            ArtifactDebuginfo::LineDirectivesOnly,
+        ),
+        ("\"line-tables-only\"", ArtifactDebuginfo::LineTablesOnly),
+        ("3", ArtifactDebuginfo::UnknownInt(3)),
+        (
+            "\"abc\"",
+            ArtifactDebuginfo::UnknownString("abc".to_string()),
+        ),
+        ("null", ArtifactDebuginfo::None),
+    ];
+    for (value, expected) in variants {
+        let s = r#"{"reason":"compiler-artifact","package_id":"cargo_metadata 0.16.0 (path+file:////cargo_metadata)","manifest_path":"/cargo_metadata/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"cargo_metadata","src_path":"/cargo_metadata/src/lib.rs","edition":"2018","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":DEBUGINFO,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["default"],"filenames":["/cargo_metadata/target/debug/deps/libcargo_metadata-27f582f7187b9a2c.rmeta"],"executable":null,"fresh":false}"#;
+        let message: Message = serde_json::from_str(&s.replace("DEBUGINFO", value)).unwrap();
+        match message {
+            Message::CompilerArtifact(artifact) => {
+                assert_eq!(artifact.profile.debuginfo, expected);
+                let de_s = serde_json::to_string(&artifact.profile.debuginfo).unwrap();
+                // Note: Roundtrip does not retain null value.
+                if value == "null" {
+                    assert_eq!(artifact.profile.debuginfo.to_string(), "0");
+                    assert_eq!(de_s, "0");
+                } else {
+                    assert_eq!(
+                        artifact.profile.debuginfo.to_string(),
+                        value.trim_matches('"')
+                    );
+                    assert_eq!(de_s, value);
+                }
+            }
+            _ => panic!("unexpected {:?}", message),
+        }
+    }
+}
+
+#[test]
+#[should_panic = "WorkspaceDefaultMembers should only be dereferenced on Cargo versions >= 1.71"]
+fn missing_workspace_default_members() {
+    let meta: Metadata = serde_json::from_str(JSON_OLD_MINIMAL).unwrap();
+    let _ = &*meta.workspace_default_members;
 }
