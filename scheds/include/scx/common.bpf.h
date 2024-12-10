@@ -386,6 +386,7 @@ void bpf_iter_bits_destroy(struct bpf_iter_bits *it) __ksym;
   }
 #define def_for_each_cpu(cpu, name) for_each_##name##_cpu(cpu)
 
+#ifdef BPF_BIT_ITERATOR_SUPPORTED
 /// Provides iterator for possible and online cpus.
 ///
 /// # Example
@@ -414,6 +415,7 @@ def_iter_new(online);
 def_iter_next(online);
 def_iter_destroy(online);
 #define for_each_online_cpu(cpu) bpf_for_each(online, cpu, NULL, 0)
+#endif /* BPF_BIT_ITERATOR_SUPPORTED */
 
 /*
  * Access a cpumask in read-only mode (typically to check bits).
