@@ -52,10 +52,17 @@ macro_rules! _memoffset__compile_error {
 /// span_of!(Struct, start ..)
 /// ```
 ///
-/// *Note*:
+/// ### Note
 /// This macro uses recursion in order to resolve the range expressions, so there is a limit to
 /// the complexity of the expression.
 /// In order to raise the limit, the compiler's recursion limit should be lifted.
+///
+/// ### Safety
+/// The inter-field form mentioned above assumes that the first field is positioned before the
+/// second.
+/// This is only guaranteed for `repr(C)` structs.
+/// Usage with `repr(Rust)` structs may yield unexpected results, like downward-going ranges,
+/// spans that include unexpected fields, empty spans, or spans that include *unexpected* padding bytes.
 ///
 /// ## Examples
 /// ```
@@ -74,15 +81,13 @@ macro_rules! _memoffset__compile_error {
 ///     egg: [[u8; 4]; 4]
 /// }
 ///
-/// fn main() {
-///     assert_eq!(0..84,  span_of!(Blarg, ..));
-///     assert_eq!(0..8,   span_of!(Blarg, .. y));
-///     assert_eq!(0..64,  span_of!(Blarg, ..= y));
-///     assert_eq!(0..8,   span_of!(Blarg, x));
-///     assert_eq!(8..84,  span_of!(Blarg, y ..));
-///     assert_eq!(0..8,   span_of!(Blarg, x .. y));
-///     assert_eq!(0..64,  span_of!(Blarg, x ..= y));
-/// }
+/// assert_eq!(0..84,  span_of!(Blarg, ..));
+/// assert_eq!(0..8,   span_of!(Blarg, .. y));
+/// assert_eq!(0..64,  span_of!(Blarg, ..= y));
+/// assert_eq!(0..8,   span_of!(Blarg, x));
+/// assert_eq!(8..84,  span_of!(Blarg, y ..));
+/// assert_eq!(0..8,   span_of!(Blarg, x .. y));
+/// assert_eq!(0..64,  span_of!(Blarg, x ..= y));
 /// ```
 #[macro_export(local_inner_macros)]
 macro_rules! span_of {
