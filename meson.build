@@ -138,7 +138,7 @@ if should_build_libbpf
 
   message('Fetching libbpf repo')
   libbpf_commit = 'c5f22aca0f3aa855daa159b2777472b35e721804'
-  run_command(fetch_libbpf, meson.current_build_dir(), libbpf_commit, check: true)
+#  run_command(fetch_libbpf, meson.current_build_dir(), libbpf_commit, check: true)
 
   make_jobs = 1
   if nproc.found()
@@ -194,7 +194,7 @@ endif
 if should_build_bpftool
   message('Fetching bpftool repo')
   bpftool_commit = '183e7010387d1fc9f08051426e9a9fbd5f8d409e'
-  run_command(fetch_bpftool, meson.current_build_dir(), bpftool_commit, check: true)
+#  run_command(fetch_bpftool, meson.current_build_dir(), bpftool_commit, check: true)
 
   bpftool_target = custom_target('bpftool_target',
               output: '@PLAINNAME@.__PHONY__',
