@@ -526,9 +526,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.7"
+version = "1.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a012a0df96dd6d06ba9a1b29d6402d1a5d77c6befd2566afdc26e10603dc93d7"
+checksum = "5c1599538de2394445747c8cf7935946e3cc27e9625f889d979bfb2aaf569362"
 dependencies = [
  "shlex",
 ]
@@ -1256,6 +1256,24 @@ dependencies = [
  "openat",
  "serde",
  "thiserror 1.0.69",
+ "threadpool",
+]
+
+[[package]]
+name = "fb_procfs"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8748972699ec5b99570e031841f449612e266d2106de7482ad76de003cfddba"
+dependencies = [
+ "below-common",
+ "lazy_static",
+ "libc",
+ "nix 0.29.0",
+ "openat",
+ "parking_lot",
+ "serde",
+ "slog",
+ "thiserror 2.0.10",
  "threadpool",
 ]
 
@@ -2059,7 +2077,9 @@ version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
+ "flate2",
  "memchr",
+ "ruzstd",
 ]
 
 [[package]]
@@ -2699,6 +2719,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7c45b9784283f1b2e7fb61b42047c2fd678ef0960d4f6f1eba131594cc369d4"
 
 [[package]]
+name = "ruzstd"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2718,6 +2747,16 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "scx_bpf_unittests"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "indoc",
+ "libbpf-sys",
+ "object",
+]
 
 [[package]]
 name = "scx_bpfland"
@@ -2785,7 +2824,7 @@ dependencies = [
  "combinations",
  "crossbeam",
  "ctrlc",
- "fb_procfs",
+ "fb_procfs 0.7.1",
  "gpoint",
  "hex",
  "itertools 0.13.0",
@@ -2813,7 +2852,7 @@ dependencies = [
  "crossbeam",
  "ctrlc",
  "fastrand",
- "fb_procfs",
+ "fb_procfs 0.7.1",
  "lazy_static",
  "libbpf-rs",
  "libc",
@@ -2869,7 +2908,7 @@ dependencies = [
  "cgroupfs",
  "clap",
  "ctrlc",
- "fb_procfs",
+ "fb_procfs 0.7.1",
  "itertools 0.13.0",
  "lazy_static",
  "libbpf-rs",
@@ -2891,7 +2930,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "ctrlc",
- "fb_procfs",
+ "fb_procfs 0.7.1",
  "lazy_static",
  "libbpf-rs",
  "libc",
@@ -2964,7 +3003,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "ctrlc",
- "fb_procfs",
+ "fb_procfs 0.7.1",
  "libbpf-rs",
  "libc",
  "log",
@@ -3086,6 +3125,7 @@ dependencies = [
  "config",
  "criterion",
  "crossterm 0.28.1",
+ "fb_procfs 0.9.0",
  "futures",
  "glob",
  "hashbrown 0.15.2",
@@ -3716,6 +3756,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e672c95779cf947c5311f83787af4fa8fffd12fb27e4993211a84bdfd9610f9c"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "twox-hash"
+version = "1.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
+dependencies = [
+ "cfg-if",
+ "static_assertions",
 ]
 
 [[package]]
