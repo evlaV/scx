@@ -349,12 +349,14 @@ if enable_rust
 
   run_target('fetch', command: [cargo_fetch, cargo], env: cargo_env)
 
-  rust_scheds = ['scx_lavd', 'scx_bpfland', 'scx_rustland', 'scx_rlfifo',
-                 'scx_flash', 'scx_rusty', 'scx_p2dq',
-                 'scx_layered', 'scx_mitosis', 'scx_tickless']
-  rust_misc = ['scx_stats', 'scx_stats_derive', 'scx_utils',
-               'scx_rustland_core',
-               'scx_loader']
+  rust_scheds = ['scx_lavd']
+#  , 'scx_bpfland', 'scx_rustland', 'scx_rlfifo',
+#                 'scx_flash', 'scx_rusty', 'scx_p2dq',
+#                 'scx_layered', 'scx_mitosis', 'scx_tickless']
+  rust_misc = ['scx_stats', 'scx_stats_derive', 'scx_utils']
+#  ,
+#               'scx_rustland_core',
+#               'scx_loader']
 
   sched_deps = [libbpf, bpftool_target]
   cargo_cmd = [cargo, 'build', '--manifest-path=@INPUT@', '--target-dir=@OUTDIR@',
