@@ -83,7 +83,7 @@ executable('cc_cflags_probe', 'meson-scripts/cc_cflags_probe.c', install: false,
 jq = find_program('jq')
 make = find_program('make')
 nproc = find_program('nproc')
-protoc = find_program('protoc', required: true)
+# protoc = find_program('protoc', required: true)
 llvm_strip = find_program('llvm-strip', required: true)
 seccomp = dependency('libseccomp', required: true)
 
@@ -139,7 +139,7 @@ if should_build_libbpf
 
   message('Fetching libbpf repo')
   libbpf_commit = 'b4fa3e39a77fd65574fb5f899486795fc3d89bd9'
-  run_command(fetch_libbpf, meson.current_build_dir(), libbpf_commit, check: true)
+  # run_command(fetch_libbpf, meson.current_build_dir(), libbpf_commit, check: true)
 
   make_jobs = 1
   if nproc.found()
@@ -195,7 +195,7 @@ endif
 if should_build_bpftool
   message('Fetching bpftool repo')
   bpftool_commit = '183e7010387d1fc9f08051426e9a9fbd5f8d409e'
-  run_command(fetch_bpftool, meson.current_build_dir(), bpftool_commit, check: true)
+  # run_command(fetch_bpftool, meson.current_build_dir(), bpftool_commit, check: true)
 
   bpftool_target = custom_target('bpftool_target',
               output: '@PLAINNAME@.__PHONY__',
@@ -367,11 +367,14 @@ if enable_rust
 
   run_target('fetch', command: [cargo_fetch, cargo], env: cargo_env)
 
-  rust_scheds = ['scx_lavd', 'scx_bpfland', 'scx_rustland', 'scx_rlfifo',
-                 'scx_flash', 'scx_cosmos', 'scx_rusty', 'scx_p2dq',
-                 'scx_layered', 'scx_mitosis', 'scx_tickless', 'scx_chaos']
-  rust_misc = ['scx_stats', 'scx_stats_derive', 'scx_utils',
-               'scx_rustland_core']
+  rust_scheds = ['scx_lavd']
+#                 'scx_bpfland', 'scx_rustland', 'scx_rlfifo',
+#                 'scx_flash', 'scx_rusty', 'scx_p2dq',
+#                 'scx_layered', 'scx_mitosis', 'scx_tickless', 'scx_chaos']
+  rust_misc = ['scx_stats', 'scx_utils']
+#               'scx_stats_derive',
+#               'scx_rustland_core',
+#               'scx_loader']
 
   sched_deps = [libbpf, bpftool_target]
   cargo_cmd = [cargo, 'build', '--manifest-path=@INPUT@', '--target-dir=@OUTDIR@',
