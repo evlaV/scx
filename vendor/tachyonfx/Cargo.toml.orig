@@ -1,0 +1,100 @@
+[workspace]
+members = [
+    ".",
+    "examples/common",
+    "examples/minimal",
+    "examples/basic-effects",
+    "examples/effect-showcase",
+    "examples/tweens",
+    "examples/fx-chart",
+    "examples/effect-registry",
+]
+
+[workspace.dependencies]
+ratatui = { version = "0.30.0", default-features = false }
+compact_str = { version = "0.9.0", default-features = false }
+crossterm = "0.29.0"
+tachyonfx = { path = "." }
+bon = { version = "3.8.1", default-features = false }
+
+[package]
+name = "tachyonfx"
+version = "0.22.0"
+edition = "2021"
+license = "MIT"
+description = "A ratatui library for creating shader-like effects in TUIs."
+repository = "https://github.com/junkdog/tachyonfx"
+homepage = "https://github.com/junkdog/tachyonfx"
+documentation = "https://docs.rs/tachyonfx"
+readme = "README.md"
+keywords = ["ratatui", "terminal", "effects", "UI", "TUI"]
+categories = ["command-line-interface"]
+authors = ["Adrian Papari <junkdog@angelhill.net>"]
+exclude = ["images/*.gif", "docs/assets/*.gif", ".*", "scripts/*"]
+
+[dependencies]
+anpa = { version = "0.10.0", optional = true }
+bon = { workspace = true }
+compact_str = { workspace = true }
+micromath = "2.1.0"
+ratatui = { workspace = true }
+thiserror = { version = "2.0.15", default-features = false, features = [] }
+unicode-width = "0.2.0"
+web-time = { version = "1.1.0", optional = true }
+
+[dev-dependencies]
+ansi-to-tui = "7.0.0"
+colorsys = "0.7.0"
+regex = "1.11.1"
+indoc = "2.0.6"
+crossterm = { workspace = true }
+criterion = "0.7.0"
+
+[features]
+default = ["std", "crossterm", "dsl"]
+std = ["bon/std", "compact_str/std", "thiserror/std", "ratatui/std"]
+crossterm = ["std", "ratatui/crossterm"]
+dsl = ["dep:anpa"]
+sendable = []
+std-duration = ["std"]
+wasm = ["dep:web-time"]
+web-time = ["wasm"]  # deprecated: use `wasm` instead
+
+
+
+# DISABLED: color_interpolation benchmark has compilation issues due to ratatui version conflict
+# ansi-to-tui depends on ratatui 0.29.0 while main project uses ratatui 0.30.0-alpha.5
+# [[bench]]
+# name = "color_interpolation"
+# harness = false
+
+[[bench]]
+name = "color_conversion"
+harness = false
+
+[[bench]]
+name = "cell_filter"
+harness = false
+
+[[bench]]
+name = "cell_iteration"
+harness = false
+
+[lints.clippy]
+std_instead_of_core = "warn"
+std_instead_of_alloc = "warn"
+alloc_instead_of_core = "warn"
+
+[profile.bench]
+lto = true
+codegen-units = 1
+debug = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(not_disabled_due_to_version_conflict)'] }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-in-header", "docs-assets/doc-header.html"]
+# Ensure WASM files are available during docs.rs build
+# (files are committed to repo in docs-assets/)
+
