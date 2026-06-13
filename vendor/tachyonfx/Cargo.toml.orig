@@ -1,0 +1,138 @@
+[workspace]
+members = [
+    ".",
+    "examples/common",
+    "examples/minimal",
+    "examples/basic-effects",
+    "examples/effect-showcase",
+    "examples/tweens",
+    "examples/effect-registry",
+]
+
+[package]
+name = "tachyonfx"
+version = "0.25.0"
+edition = "2021"
+license = "MIT"
+description = "A ratatui library for creating shader-like effects in TUIs."
+repository = "https://github.com/ratatui/tachyonfx"
+homepage = "https://github.com/ratatui/tachyonfx"
+documentation = "https://docs.rs/tachyonfx"
+readme = "README.md"
+keywords = ["ratatui", "terminal", "effects", "UI", "TUI"]
+categories = ["command-line-interface"]
+authors = ["Adrian Papari <junkdog@angelhill.net>"]
+exclude = ["images/*.gif", "docs/assets/*.gif", ".*", "scripts/*"]
+
+[workspace.dependencies]
+ratatui-core = { version = "0.1.0", default-features = false }
+compact_str = { version = "0.9.0", default-features = false }
+crossterm = "0.29.0"
+tachyonfx = { path = "." }
+bon = { version = "3.8.2", default-features = false }
+
+# used by tests and examples, not by tachyonfx itself
+[workspace.dependencies.ratatui]
+version = "0.30.0"
+default-features = false
+features = ["crossterm", "layout-cache", "std"]
+
+[dependencies]
+anpa = { version = "0.10.0", optional = true }
+bon = { workspace = true }
+compact_str = { workspace = true }
+micromath = "2.1.0"
+ratatui-core = { workspace = true }
+thiserror = { version = "2.0", default-features = false, features = [] }
+unicode-width = "0.2.0"
+web-time = { version = "1.1", optional = true }
+
+[dev-dependencies]
+ansi-to-tui = "8.0.1"
+colorsys = "0.7.0"
+regex = "1.11.1"
+indoc = "2.0.6"
+crossterm = { workspace = true }
+ratatui.workspace = true
+criterion = "0.8.2"
+
+[features]
+#default = ["std", "crossterm", "dsl"]
+default = ["std", "dsl"]
+std = ["bon/std", "compact_str/std", "thiserror/std", "ratatui-core/std"]
+#crossterm = ["std", "ratatui-core/crossterm"]
+dsl = ["dep:anpa"]
+sendable = []
+std-duration = ["std"]
+wasm = ["dep:web-time"]
+web-time = ["wasm"]  # deprecated: use `wasm` instead
+
+[[bench]]
+name = "color_interpolation"
+harness = false
+
+[[bench]]
+name = "color_conversion"
+harness = false
+
+[[bench]]
+name = "cell_filter"
+harness = false
+
+[[bench]]
+name = "cell_iteration"
+harness = false
+
+[[bench]]
+name = "parabolic_sin"
+harness = false
+
+[[bench]]
+name = "math_functions"
+harness = false
+
+[[bench]]
+name = "hsl_hsv_conversion"
+harness = false
+
+[[bench]]
+name = "lightness_adjustment"
+harness = false
+
+[[bench]]
+name = "saturation_adjustment"
+harness = false
+
+[lints.clippy]
+# no_std enforcement
+std_instead_of_core = "warn"
+std_instead_of_alloc = "warn"
+alloc_instead_of_core = "warn"
+# performance
+redundant_clone = "warn"
+cloned_instead_of_copied = "warn"
+trivially_copy_pass_by_ref = "warn"
+needless_pass_by_value = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+# dead code / unused
+unused_self = "warn"
+needless_pass_by_ref_mut = "warn"
+# clarity
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args = "warn"
+map_unwrap_or = "warn"
+flat_map_option = "warn"
+
+[profile.bench]
+lto = true
+codegen-units = 1
+debug = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(not_disabled_due_to_version_conflict)'] }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-in-header", "docs-assets/doc-header.html"]
+
