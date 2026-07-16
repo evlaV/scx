@@ -1,0 +1,1585 @@
+//! `AssertResult::merge` and the per-field worst-wins / lowest-non-zero
+//! / sum aggregation rules for `ScenarioStats`. Every polarity is
+//! exercised in both directions so a sign-flip regression surfaces
+//! regardless of which side carries the worse value.
+
+use super::tests_common::rpt;
+use super::*;
+
+#[test]
+fn merge_cgroups() {
+    let r1 = assert_not_starved(&[
+        rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0, 1], 50),
+        rpt(2, 1000, 5e9 as u64, 6e8 as u64, &[0, 1], 60),
+    ]);
+    let r2 = assert_not_starved(&[
+        rpt(3, 1000, 5e9 as u64, 25e8 as u64, &[2, 3], 50),
+        rpt(4, 1000, 5e9 as u64, 26e8 as u64, &[2, 3], 50),
+    ]);
+    let mut m = r1;
+    m.merge(r2);
+    assert_eq!(m.stats.cgroups.len(), 2);
+    assert_eq!(m.stats.total_workers, 4);
+    assert!(m.is_pass(), "diff cgroups diff off_cpu should pass");
+}
+
+#[test]
+fn merge_takes_worst_gap() {
+    let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 100)]);
+    let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 500)]);
+    let mut m = r1;
+    m.merge(r2);
+    assert_eq!(m.stats.worst_gap_ms, 500);
+    assert_eq!(m.stats.worst_gap_cpu, 1);
+}
+
+/// Reverse direction of [`merge_takes_worst_gap`]: the forward
+/// case picks `other`'s larger gap and must re-couple to
+/// `other`'s CPU. This test pins the self-retains branch — when
+/// `self.worst_gap_ms > other.worst_gap_ms`, `worst_gap_cpu`
+/// must stay on `self`'s CPU and NOT leak over to `other`'s.
+///
+/// Without both directions pinned, a regression that always
+/// overwrote `worst_gap_cpu` from `other` (regardless of which
+/// gap won) would pass the forward test — the forward case
+/// already asks for `other`'s cpu anyway — and land silently.
+/// Pairing the two directions is what actually guards the
+/// "coupled fields stay coupled" invariant from the merge doc.
+#[test]
+fn merge_takes_worst_gap_reverse_self_retains() {
+    // r1 has the larger gap (700ms on cpu 0); r2 has the smaller
+    // gap (200ms on cpu 1). After merge, self must keep both
+    // its 700ms AND its cpu 0 — not adopt cpu 1 from the
+    // loser's report.
+    let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 700)]);
+    let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 200)]);
+    let mut m = r1;
+    m.merge(r2);
+    assert_eq!(
+        m.stats.worst_gap_ms, 700,
+        "self's larger gap must be retained",
+    );
+    assert_eq!(
+        m.stats.worst_gap_cpu, 0,
+        "worst_gap_cpu must stay coupled to self's worst_gap_ms — \
+         a regression overwriting cpu from other would set this to 1",
+    );
+}
+
+#[test]
+fn merge_takes_worst_spread() {
+    let r1 = assert_not_starved(&[
+        rpt(1, 1000, 5e9 as u64, 1e9 as u64, &[0], 50),
+        rpt(2, 1000, 5e9 as u64, 12e8 as u64, &[0], 50),
+    ]); // spread = 4%
+    let r2 = assert_not_starved(&[
+        rpt(3, 1000, 5e9 as u64, 1e9 as u64, &[1], 50),
+        rpt(4, 1000, 5e9 as u64, 15e8 as u64, &[1], 50),
+    ]); // spread = 10%
+    let mut m = r1;
+    m.merge(r2);
+    assert!((m.stats.worst_spread - 10.0).abs() < 0.1);
+}
+
+#[test]
+fn merge_skip_plus_explicit_pass_demotes_skip() {
+    // A bare `AssertResult::pass()` has empty outcomes (the
+    // zero-allocation Pass identity). Merging it onto a skip leaves
+    // the stream all-Skip, so it does NOT demote. To demote a skip,
+    // the passing side must carry an explicit `Outcome::Pass` marker
+    // via `record_pass()` — that's the "real Pass beats Skip" semantic.
+    let mut a = AssertResult::skip("optional");
+    let mut b = AssertResult::pass();
+    b.record_pass();
+    a.merge(b);
+    assert!(
+        !a.is_skip(),
+        "explicit Pass in the merged stream means not all-Skip"
+    );
+    assert!(a.is_pass(), "explicit Pass + no Fail → is_pass=true");
+}
+
+#[test]
+fn merge_skip_plus_empty_pass_stays_skip() {
+    // Companion to merge_skip_plus_explicit_pass_demotes_skip: bare
+    // `pass()` (empty outcomes) cannot demote a skip; the merged
+    // stream is still all-Skip.
+    let mut a = AssertResult::skip("optional");
+    let b = AssertResult::pass();
+    a.merge(b);
+    assert!(
+        a.is_skip(),
+        "empty pass() merges to a no-op; stream stays all-Skip"
+    );
+    assert!(!a.is_pass(), "all-Skip is not pass");
+}
+
+#[test]
+fn merge_skip_plus_fail_is_fail_not_skip() {
+    let mut a = AssertResult::skip("topo missing");
+    let mut b = AssertResult::pass();
+    b.record_fail(AssertDetail::new(DetailKind::Other, "synthetic fail"));
+    a.merge(b);
+    assert!(a.is_fail());
+    assert!(!a.is_skip());
+}
+
+#[test]
+fn merge_accumulates_totals() {
+    let r1 = assert_not_starved(&[rpt(1, 1000, 5e9 as u64, 5e8 as u64, &[0], 50)]);
+    let r2 = assert_not_starved(&[rpt(2, 1000, 5e9 as u64, 5e8 as u64, &[1], 50)]);
+    let mut m = r1;
+    m.merge(r2);
+    assert_eq!(m.stats.total_workers, 2);
+    assert_eq!(m.stats.total_cpus, 2);
+}
+
+/// Multi-cgroup merge-aggregation contract: merging `N > 2`
+/// `AssertResult`s (each carrying one populated `CgroupStats`
+/// plus `ScenarioStats` headline fields) must:
+///   - append every per-cgroup entry into `stats.cgroups` in
+///     merge order, preserving cardinality;
+///   - pick the worst value of every merge-folded higher-is-worse
+///     `worst_*` field across all merged cgroups;
+///   - pick the lowest-non-zero value of `worst_page_locality`
+///     (0.0 is the unreported sentinel, matching the accumulator-pass
+///     convention in `AssertResult::pass().merge(real)`);
+///   - SUM `total_iterations` across all cgroups, not max it.
+///
+/// (The wake / run-delay distributions and the iteration efficiencies are
+/// no longer merge-folded — they re-pool post-merge; see the `repool_*`
+/// tests.)
+///
+/// Sibling `merge_scenario_stats_worst_wins_and_iterations_sum`
+/// already covers the 2-cgroup case with headline fields only;
+/// this test exercises 3 cgroups AND the per-cgroup accumulator
+/// (`stats.cgroups.extend`) so a regression that dropped
+/// cgroups, clobbered the per-cgroup vector, or flipped one of
+/// the polarity folds surfaces in the stronger form.
+#[test]
+fn merge_three_cgroups_worst_wins_and_iterations_sum() {
+    fn mk(
+        worst_spread: f64,
+        worst_mig: f64,
+        page_locality: f64,
+        total_iters: u64,
+        cg_total_iters: u64,
+    ) -> AssertResult {
+        let cg = CgroupStats {
+            total_iterations: cg_total_iters,
+            page_locality,
+            ..CgroupStats::default()
+        };
+        // The wake/run-delay and iteration-efficiency roll-ups are no longer
+        // ScenarioStats fields (they are Distribution / WorstLowest, re-pooled
+        // post-merge); this test now covers only the merge-folded worst-wins
+        // (`worst_spread`, `worst_migration_ratio`, `worst_page_locality`),
+        // `total_iterations`, and the `cgroups.extend` accumulation.
+        AssertResult {
+            outcomes: vec![],
+            passes: vec![],
+            stats: ScenarioStats {
+                total_iterations: total_iters,
+                worst_spread,
+                worst_migration_ratio: worst_mig,
+                worst_page_locality: page_locality,
+                cgroups: vec![cg],
+                ..ScenarioStats::default()
+            },
+            measurements: std::collections::BTreeMap::new(),
+            info_notes: vec![],
+        }
+    }
+
+    // Three cgroups with deliberately heterogeneous values so
+    // each `worst_*` aggregation is sourced from a DIFFERENT
+    // cgroup — a regression that folded only within-cgroup
+    // would still produce a plausible-looking aggregate on a
+    // 2-cgroup test but would fail here.
+    let mut acc = mk(10.0, 0.1, 0.8, 100, 100);
+    acc.merge(mk(5.0, 0.3, 0.5, 200, 200));
+    acc.merge(mk(20.0, 0.2, 0.9, 400, 400));
+
+    let s = &acc.stats;
+    assert_eq!(
+        s.cgroups.len(),
+        3,
+        "3 cgroups must accumulate; a missing entry means stats.cgroups.extend dropped a merge",
+    );
+    // Per-cgroup order is preserved (merge calls, in order):
+    assert_eq!(s.cgroups[0].total_iterations, 100);
+    assert_eq!(s.cgroups[1].total_iterations, 200);
+    assert_eq!(s.cgroups[2].total_iterations, 400);
+
+    // Worst-wins across 3 cgroups (higher-is-worse):
+    assert_eq!(s.worst_spread, 20.0, "third cgroup's 20.0 is worst");
+    assert_eq!(s.worst_migration_ratio, 0.3, "second cgroup's 0.3 is worst");
+    // Lower-is-worse rollup (`worst_page_locality`, `fold_lowest_nonzero`):
+    // every value is strictly positive so the 0-sentinel branch never wins.
+    assert_eq!(
+        s.worst_page_locality, 0.5,
+        "second cgroup's 0.5 is the lowest-non-zero — 0 sentinel never wins",
+    );
+    // total_iterations SUMS across cgroups, not maxes:
+    assert_eq!(
+        s.total_iterations,
+        100 + 200 + 400,
+        "total_iterations must sum (not max) across all merged cgroups",
+    );
+}
+
+#[test]
+fn iterations_per_worker_distinguishes_no_workers_from_ran_zero() {
+    // num_workers == 0: no per-worker throughput is defined → None.
+    let no_workers = CgroupStats {
+        num_workers: 0,
+        total_iterations: 0,
+        ..CgroupStats::default()
+    };
+    assert_eq!(no_workers.iterations_per_worker(), None);
+
+    // Workers ran but completed zero iterations → measured Some(0.0),
+    // NOT None: this is a real throughput collapse, not missing data.
+    let ran_zero = CgroupStats {
+        num_workers: 4,
+        total_iterations: 0,
+        ..CgroupStats::default()
+    };
+    assert_eq!(ran_zero.iterations_per_worker(), Some(0.0));
+
+    // Workers ran with iterations → the throughput value.
+    let ran = CgroupStats {
+        num_workers: 4,
+        total_iterations: 400,
+        ..CgroupStats::default()
+    };
+    assert_eq!(ran.iterations_per_worker(), Some(100.0));
+}
+
+#[test]
+fn repool_worst_iterations_per_worker_lets_measured_zero_win() {
+    // A cgroup that ran zero iterations (per-cgroup Some(0.0)) is the worst
+    // per-worker throughput and MUST win the lowest bucket; a later healthy
+    // reading does not displace it. `populate_run_distribution_metrics`
+    // selects lowest-wins None-aware over the per-cgroup
+    // `iterations_per_worker()` — the semantic the deleted cross-cgroup
+    // `fold_lowest_some` carried.
+    fn cg(num_workers: usize, total_iterations: u64) -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.stats.cgroups = vec![CgroupStats {
+            num_workers,
+            total_iterations,
+            ..CgroupStats::default()
+        }];
+        r
+    }
+    let mut acc = AssertResult::pass();
+    acc.merge(cg(1, 100)); // iterations_per_worker == 100.0
+    acc.merge(cg(4, 0)); // iterations_per_worker == Some(0.0) (ran zero)
+    acc.merge(cg(1, 250)); // iterations_per_worker == 250.0
+    populate_run_distribution_metrics(&mut acc.stats);
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("worst_iterations_per_worker")
+            .copied(),
+        Some(0.0),
+        "a cgroup that ran zero iterations must win the worst bucket",
+    );
+}
+
+#[test]
+fn repool_worst_iterations_per_worker_skips_no_data() {
+    // No-worker cgroups (num_workers == 0 → iterations_per_worker() None) are
+    // skipped, never treated as zero: an all-None cohort writes NO key
+    // (absence preserved, distinct from a measured 0.0), and a None never
+    // displaces a real reading.
+    fn cg(num_workers: usize, total_iterations: u64) -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.stats.cgroups = vec![CgroupStats {
+            num_workers,
+            total_iterations,
+            ..CgroupStats::default()
+        }];
+        r
+    }
+    let mut acc = AssertResult::pass();
+    acc.merge(cg(0, 0));
+    acc.merge(cg(0, 0));
+    populate_run_distribution_metrics(&mut acc.stats);
+    assert_eq!(
+        acc.stats.ext_metrics.get("worst_iterations_per_worker"),
+        None,
+        "all-None cohort must write no key (absence != measured 0.0)",
+    );
+
+    let mut acc2 = AssertResult::pass();
+    acc2.merge(cg(1, 75)); // Some(75.0)
+    acc2.merge(cg(0, 0)); // None, skipped
+    populate_run_distribution_metrics(&mut acc2.stats);
+    assert_eq!(
+        acc2.stats
+            .ext_metrics
+            .get("worst_iterations_per_worker")
+            .copied(),
+        Some(75.0),
+        "a None contributor must not displace a real reading",
+    );
+}
+
+#[test]
+fn repool_worst_iterations_per_cpu_sec_lowest_wins_none_aware() {
+    // worst_iterations_per_cpu_sec (overcommit-invariant efficiency) uses the
+    // same lowest-wins None-aware re-pool: the least-efficient cgroup wins, a
+    // measured Some(0.0) beats a healthy reading, and None (no workers or no
+    // on-CPU time) is skipped, never fabricated as zero.
+    fn cg(num_workers: usize, total_iterations: u64, cpu_ns: u64) -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.stats.cgroups = vec![CgroupStats {
+            num_workers,
+            total_iterations,
+            total_cpu_time_ns: cpu_ns,
+            ..CgroupStats::default()
+        }];
+        r
+    }
+    let mut acc = AssertResult::pass();
+    acc.merge(cg(0, 0, 0)); // None (no workers / no on-CPU time), skipped
+    acc.merge(cg(1, 900, 1_000_000_000)); // 900 / 1.0s == 900.0
+    acc.merge(cg(1, 0, 1_000_000_000)); // 0 / 1.0s == Some(0.0), worst
+    acc.merge(cg(1, 1500, 1_000_000_000)); // 1500.0, does not displace 0.0
+    populate_run_distribution_metrics(&mut acc.stats);
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("worst_iterations_per_cpu_sec")
+            .copied(),
+        Some(0.0),
+        "least-efficient cgroup (measured 0.0) wins; None skipped",
+    );
+}
+
+/// The POOLED `iterations_per_cpu_sec` Rate (the cross-cgroup re-pool) is
+/// Σiterations / Σcpu-seconds across cgroups — NOT a mean of per-cgroup
+/// ratios, NOT the worst single cgroup. Unequal per-cgroup cpu-time makes
+/// the three distinct: re-pool 101.0 vs mean-of-ratios ~500.6 vs worst ~1.11
+/// (the value the rejected merge-fold route would wrongly produce). The new
+/// pooled metric must NOT mutate the existing worst_iterations_per_cpu_sec
+/// (the min-fold starvation selector).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_repools_across_cgroups() {
+    // cg1: 1000 iters over 1.0 cpu-s -> 1000/cpu-s.
+    let cg1 = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // cg2: 10 iters over 9.0 cpu-s -> ~1.11/cpu-s.
+    let cg2 = CgroupStats {
+        total_iterations: 10,
+        total_cpu_time_ns: 9_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let stats_for = |cg: &CgroupStats| ScenarioStats {
+        total_iterations: cg.total_iterations,
+        cgroups: vec![cg.clone()],
+        ..ScenarioStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: stats_for(cg),
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&cg1);
+    acc.merge(mk(&cg2));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // Σiters / Σcpu-s = (1000 + 10) / ((1e9 + 9e9)/1e9) = 1010 / 10.0 = 101.0.
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(101.0),
+        "pooled rate must be Σiters/Σcpu-s = 101.0, NOT mean-of-ratios \
+         (~500.6) or the worst cgroup (~1.11); got {:?}",
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec"),
+    );
+    // BOTH cgroups have measured cpu-time, so the ext-only pooled numerator
+    // equals the merge-summed typed total_iterations (both Σ over all
+    // cgroups). They diverge only when a zero-cpu-time cgroup is excluded from
+    // the pooled sum — see populate_run_pooled_..._excludes_zero_cpu_cgroup.
+    assert_eq!(acc.stats.total_iterations, 1010);
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(acc.stats.total_iterations as f64),
+        "total_iterations_pooled must equal the merge-summed typed total_iterations \
+         when every cgroup is measured",
+    );
+    // The WorstLowest worst_iterations_per_cpu_sec (lowest-wins starvation
+    // selector) is DISTINCT from the pooled rate: re-pooled separately by
+    // populate_run_distribution_metrics, the lower per-cgroup rate (cg2's
+    // 10/9) wins. The pooled iterations_per_cpu_sec Rate above is unaffected.
+    populate_run_distribution_metrics(&mut acc.stats);
+    let worst = acc
+        .stats
+        .ext_metrics
+        .get("worst_iterations_per_cpu_sec")
+        .copied()
+        .expect("worst_iterations_per_cpu_sec present in ext_metrics");
+    assert!(
+        (worst - 10.0 / 9.0).abs() < 1e-9,
+        "worst_iterations_per_cpu_sec stays the lowest-wins selector (~1.11), \
+         distinct from the pooled rate; got {worst}",
+    );
+}
+
+/// Host-only / no-schedstat run: every cgroup reports zero on-CPU time, so
+/// the pooled rate is undefined. The helper inserts NEITHER component
+/// (both-or-neither) so no rate derives — matching
+/// `CgroupStats::iterations_per_cpu_sec`'s None-on-zero.
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_absent_on_zero_cpu_time() {
+    let cg = CgroupStats {
+        total_iterations: 500,
+        total_cpu_time_ns: 0,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    assert!(
+        !acc.stats.ext_metrics.contains_key("iterations_per_cpu_sec"),
+        "no pooled rate when Σcpu-time is 0",
+    );
+    assert!(
+        !acc.stats.ext_metrics.contains_key("total_cpu_time_sec")
+            && !acc
+                .stats
+                .ext_metrics
+                .contains_key("total_iterations_pooled"),
+        "both-or-neither: neither component inserted when Σcpu-time is 0",
+    );
+}
+
+/// Mixed run: one cgroup has iterations but ZERO measured cpu-time (schedstat
+/// gap), the other has both. The zero-cpu cgroup is EXCLUDED from BOTH pooled
+/// sums (mirroring the per-cgroup None-on-zero) — its iterations are NOT
+/// credited against the measured cgroup's cpu-seconds, which would inflate the
+/// cohort efficiency. So the pooled rate is the measured cgroup's rate, and
+/// total_iterations_pooled (measured only) is strictly LESS than the
+/// merge-summed typed total_iterations (which includes both).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_excludes_zero_cpu_cgroup() {
+    // Unmeasured: 500 iters, 0 cpu-time (schedstat unavailable).
+    let unmeasured = CgroupStats {
+        total_iterations: 500,
+        total_cpu_time_ns: 0,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // Measured: 1000 iters over 1.0 cpu-s -> 1000/cpu-s.
+    let measured = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&unmeasured);
+    acc.merge(mk(&measured));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // Pooled rate excludes the zero-cpu cgroup: 1000 / 1.0 == 1000.0, NOT
+    // (500 + 1000) / 1.0 == 1500.0 (which would credit un-costed iters).
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(1000.0),
+        "zero-cpu cgroup's iters must NOT inflate the pooled rate; got {:?}",
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec"),
+    );
+    // The pooled numerator counts only the measured cgroup (1000) and is
+    // strictly LESS than the merge-summed typed total_iterations (1500).
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(1000.0),
+    );
+    assert_eq!(acc.stats.total_iterations, 1500);
+}
+
+/// Single measured cgroup: the pooled rate is exactly that cgroup's per-cgroup
+/// rate (degenerate Σ over one element).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_single_cgroup() {
+    let cg = CgroupStats {
+        total_iterations: 750,
+        total_cpu_time_ns: 3_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    // 750 / 3.0 == 250.0 == the per-cgroup rate.
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        cg.iterations_per_cpu_sec(),
+    );
+    assert_eq!(
+        acc.stats.ext_metrics.get("iterations_per_cpu_sec").copied(),
+        Some(250.0),
+    );
+}
+
+/// Empty cgroups vec: nothing to pool, no keys inserted (both-or-neither).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_empty_cgroups() {
+    let mut stats = ScenarioStats::default();
+    populate_run_pooled_iterations_per_cpu_sec(&mut stats);
+    assert!(
+        stats.ext_metrics.is_empty(),
+        "no components inserted for an empty cgroups vec",
+    );
+}
+
+/// Costed-yet-idle cgroup INCLUDED in both sums (the symmetric counterpart of
+/// excludes_zero_cpu_cgroup): a cgroup with measured cpu-time but ZERO
+/// iterations (a stalled/spinning worker that burned CPU doing no work). The
+/// filter gates on total_cpu_time_ns > 0 (NOT on iterations), so this cgroup IS
+/// included — its CPU adds to the denominator and its 0 iters add nothing to
+/// the numerator, correctly diluting the cohort rate downward (burning CPU with
+/// no work IS less efficient).
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_includes_costed_idle_cgroup() {
+    // Costed but idle: 0 iters over 2.0 cpu-s.
+    let idle = CgroupStats {
+        total_iterations: 0,
+        total_cpu_time_ns: 2_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    // Productive: 1000 iters over 1.0 cpu-s.
+    let busy = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1_000_000_000,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mk = |cg: &CgroupStats| AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg.clone()],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let mut acc = mk(&idle);
+    acc.merge(mk(&busy));
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+
+    // The idle cgroup's CPU MUST count: rate = 1000 / ((2e9+1e9)/1e9) = 1000/3.0
+    // == ~333.33, NOT 1000/1.0 == 1000 (which would ignore the wasted CPU).
+    let rate = acc
+        .stats
+        .ext_metrics
+        .get("iterations_per_cpu_sec")
+        .copied()
+        .expect("pooled rate present");
+    assert!(
+        (rate - 1000.0 / 3.0).abs() < 1e-9,
+        "costed-idle cgroup's CPU must dilute the rate to ~333.33, not 1000; got {rate}",
+    );
+    // Numerator = 0 + 1000; denominator counts the idle cgroup's 2.0s too.
+    assert_eq!(
+        acc.stats
+            .ext_metrics
+            .get("total_iterations_pooled")
+            .copied(),
+        Some(1000.0),
+    );
+    assert_eq!(
+        acc.stats.ext_metrics.get("total_cpu_time_sec").copied(),
+        Some(3.0),
+    );
+}
+
+/// Tiny-denominator finite-quotient guard: a cgroup with total_cpu_time_ns=1
+/// (total_cpu_time_sec = 1e-9) and a large iteration count yields a
+/// finite-but-enormous rate (~1e12). derive_rate_metrics_from's finite guard
+/// KEEPS it — an absent rate is reserved for a zero or non-finite denominator,
+/// not a tiny one — and the pooled wrapper feeds that same guard. (u64-summed
+/// ns cannot overflow within centuries, so no overflow case is reachable.)
+#[test]
+fn populate_run_pooled_iterations_per_cpu_sec_tiny_denominator_stays_finite() {
+    let cg = CgroupStats {
+        total_iterations: 1000,
+        total_cpu_time_ns: 1,
+        num_workers: 1,
+        ..CgroupStats::default()
+    };
+    let mut acc = AssertResult {
+        outcomes: vec![],
+        passes: vec![],
+        stats: ScenarioStats {
+            total_iterations: cg.total_iterations,
+            cgroups: vec![cg],
+            ..ScenarioStats::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    populate_run_pooled_iterations_per_cpu_sec(&mut acc.stats);
+    let rate = acc
+        .stats
+        .ext_metrics
+        .get("iterations_per_cpu_sec")
+        .copied()
+        .expect("tiny-denom rate present (finite, not dropped)");
+    assert!(
+        rate.is_finite() && rate > 0.0,
+        "tiny-denom rate must be finite-but-enormous (~1e12), not inf/absent; got {rate}",
+    );
+}
+
+#[test]
+fn merge_scenario_stats_worst_wins_and_iterations_sum() {
+    // Aggregates-across-cgroups contract for the MERGE-FOLDED worst-wins
+    // fields: each takes the larger value (higher-is-worse max) and
+    // `total_iterations` sums. The wake-latency / run-delay roll-ups and the
+    // wake-latency tail ratio are no longer merge-folded (they are derived
+    // `MetricKind`s re-pooled post-merge — see the `repool_*` tests); this
+    // covers `worst_spread`, `worst_migration_ratio`, and
+    // `worst_cross_node_migration_ratio`.
+    let mut a = AssertResult::pass();
+    a.stats.total_iterations = 100;
+    a.stats.worst_spread = 5.0;
+    a.stats.worst_migration_ratio = 0.1;
+    a.stats.worst_cross_node_migration_ratio = 0.05;
+
+    let mut b = AssertResult::pass();
+    b.stats.total_iterations = 400;
+    b.stats.worst_spread = 15.0;
+    b.stats.worst_migration_ratio = 0.4;
+    b.stats.worst_cross_node_migration_ratio = 0.25;
+
+    a.merge(b);
+
+    assert_eq!(a.stats.total_iterations, 500);
+    assert_eq!(a.stats.worst_spread, 15.0);
+    assert_eq!(a.stats.worst_migration_ratio, 0.4);
+    assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.25);
+}
+
+#[test]
+fn merge_scenario_stats_worst_wins_when_other_is_smaller() {
+    // Symmetric case: when `other` reports smaller values, `self`
+    // retains its larger worst. Covers the "self wins" branch of the
+    // merge-folded scalar worst-comparisons: worst_spread,
+    // worst_migration_ratio, worst_cross_node_migration_ratio (all `.max()`)
+    // and the coupled worst_gap_ms/cpu guard. (Wake-latency / run-delay
+    // roll-ups and the wake-latency tail ratio moved to the post-merge
+    // re-pool — see the repool_* tests.)
+    let mut a = AssertResult::pass();
+    a.stats.worst_spread = 30.0;
+    a.stats.worst_gap_ms = 500;
+    a.stats.worst_gap_cpu = 7;
+    a.stats.worst_migration_ratio = 0.9;
+    a.stats.worst_cross_node_migration_ratio = 0.35;
+    a.stats.total_iterations = 500;
+
+    let mut b = AssertResult::pass();
+    b.stats.worst_spread = 5.0;
+    b.stats.worst_gap_ms = 100;
+    b.stats.worst_gap_cpu = 3;
+    b.stats.worst_migration_ratio = 0.1;
+    b.stats.worst_cross_node_migration_ratio = 0.05;
+    b.stats.total_iterations = 50;
+
+    a.merge(b);
+
+    assert_eq!(a.stats.worst_spread, 30.0);
+    assert_eq!(a.stats.worst_gap_ms, 500);
+    // `worst_gap_cpu` stays 7: coupling means it retains `self`'s
+    // index when `self` wins on `worst_gap_ms`.
+    assert_eq!(a.stats.worst_gap_cpu, 7);
+    assert_eq!(a.stats.worst_migration_ratio, 0.9);
+    assert_eq!(a.stats.worst_cross_node_migration_ratio, 0.35);
+    // Totals always sum, independent of worst-wins direction.
+    assert_eq!(a.stats.total_iterations, 550);
+}
+
+#[test]
+fn merge_worst_page_locality_lowest_non_zero() {
+    // `worst_page_locality` can't use plain `.min()` because 0.0
+    // is the "unreported" sentinel — a fresh cgroup with no NUMA
+    // readings would otherwise clobber a real reading from a
+    // reporting cgroup. The merge instead takes the lowest
+    // non-zero value.
+
+    // (a) self=0.0 (unreported) + other=0.8 (reported) → 0.8.
+    let mut a = AssertResult::pass();
+    a.stats.worst_page_locality = 0.0;
+    let mut b = AssertResult::pass();
+    b.stats.worst_page_locality = 0.8;
+    a.merge(b);
+    assert_eq!(
+        a.stats.worst_page_locality, 0.8,
+        "unreported self must adopt other's reading"
+    );
+
+    // (b) self=0.6 + other=0.8 → 0.6 (self's lower reading wins).
+    let mut a = AssertResult::pass();
+    a.stats.worst_page_locality = 0.6;
+    let mut b = AssertResult::pass();
+    b.stats.worst_page_locality = 0.8;
+    a.merge(b);
+    assert_eq!(
+        a.stats.worst_page_locality, 0.6,
+        "lower non-zero reading wins across cgroups"
+    );
+
+    // (c) self=0.8 (reported) + other=0.0 (unreported) → 0.8.
+    // Plain `.min()` would select 0.0 here — the guard rejects
+    // other's sentinel instead of overwriting self.
+    let mut a = AssertResult::pass();
+    a.stats.worst_page_locality = 0.8;
+    let mut b = AssertResult::pass();
+    b.stats.worst_page_locality = 0.0;
+    a.merge(b);
+    assert_eq!(
+        a.stats.worst_page_locality, 0.8,
+        "unreported other must not clobber self's reading"
+    );
+}
+
+#[test]
+fn merge_ext_metrics_higher_is_worse_takes_max() {
+    // "worst_spread" is registered with higher_is_worse=true → merge max.
+    let mut a = AssertResult::pass();
+    a.stats.ext_metrics.insert("worst_spread".into(), 10.0);
+    let mut b = AssertResult::pass();
+    b.stats.ext_metrics.insert("worst_spread".into(), 42.0);
+    a.merge(b);
+    assert_eq!(a.stats.ext_metrics["worst_spread"], 42.0);
+}
+
+#[test]
+fn merge_ext_metrics_higher_is_better_takes_min() {
+    // Regression: "total_iterations" is registered with
+    // higher_is_worse=false. Merge must take min (worst case)
+    // rather than max (best case). Previously returned 42.0.
+    let mut a = AssertResult::pass();
+    a.stats.ext_metrics.insert("total_iterations".into(), 10.0);
+    let mut b = AssertResult::pass();
+    b.stats.ext_metrics.insert("total_iterations".into(), 42.0);
+    a.merge(b);
+    assert_eq!(
+        a.stats.ext_metrics["total_iterations"], 10.0,
+        "higher_is_worse=false must take min on merge"
+    );
+}
+
+#[test]
+fn merge_ext_metrics_unknown_metric_defaults_to_max() {
+    // Unregistered metric names fall back to max (conservative —
+    // treat as higher-is-worse until a MetricDef is registered).
+    let mut a = AssertResult::pass();
+    a.stats.ext_metrics.insert("unknown_metric".into(), 10.0);
+    let mut b = AssertResult::pass();
+    b.stats.ext_metrics.insert("unknown_metric".into(), 42.0);
+    a.merge(b);
+    assert_eq!(a.stats.ext_metrics["unknown_metric"], 42.0);
+}
+
+#[test]
+fn merge_ext_metrics_first_insert_uses_other_value() {
+    // When the key is absent on self, insert other's value verbatim
+    // regardless of polarity (no prior value to compare against).
+    let mut a = AssertResult::pass();
+    let mut b = AssertResult::pass();
+    b.stats.ext_metrics.insert("total_iterations".into(), 77.0);
+    a.merge(b);
+    assert_eq!(a.stats.ext_metrics["total_iterations"], 77.0);
+}
+
+#[test]
+fn merge_pass_and_fail() {
+    let pass = AssertResult::pass();
+    let mut fail = AssertResult::pass();
+    fail.record_fail(AssertDetail::new(DetailKind::Other, "something failed"));
+
+    let mut merged = pass;
+    merged.merge(fail);
+    assert!(merged.is_fail(), "merging pass+fail must produce fail");
+    assert!(
+        merged
+            .failure_details()
+            .any(|d| d.message.contains("something failed"))
+    );
+}
+
+#[test]
+fn merge_fail_and_pass() {
+    let mut fail = AssertResult::pass();
+    fail.record_fail(AssertDetail::new(DetailKind::Other, "first failed"));
+    let pass = AssertResult::pass();
+
+    let mut merged = fail;
+    merged.merge(pass);
+    assert!(merged.is_fail(), "merging fail+pass must produce fail");
+}
+
+/// `merge` must preserve TWO independent invariants in lock-step:
+/// (1) outcomes vec extends (both sides' outcomes concatenate);
+/// (2) ScenarioStats fields SUM. A
+/// regression that conflated the two (e.g. clamped totals to
+/// outcomes.len()) would trip here. Pins the dual invariant
+/// cleanly: one Fail + one Skip on distinct sides, distinct
+/// stats, observe both extension AND sum.
+#[test]
+fn merge_outcomes_extend_and_stats_sum_coexist() {
+    let mut a = AssertResult::pass();
+    a.record_fail(AssertDetail::new(DetailKind::Other, "fail_a"));
+    a.stats.total_iterations = 100;
+    a.stats.total_workers = 2;
+    let mut b = AssertResult::pass();
+    b.record_skip("skip_b");
+    b.stats.total_iterations = 50;
+    b.stats.total_workers = 3;
+    a.merge(b);
+    assert_eq!(a.outcomes.len(), 2, "Fail + Skip both extend");
+    assert!(a.is_fail(), "Fail dominates the verdict");
+    assert_eq!(a.stats.total_iterations, 150, "stats SUM (not max)");
+    assert_eq!(a.stats.total_workers, 5);
+    assert_eq!(a.failure_details().count(), 1);
+    assert_eq!(a.skip_details().count(), 1);
+}
+
+/// `AssertResult::merge` Inconclusive precedence: the lattice
+/// is `Fail > Inconclusive > Pass > Skip`. Pin every cell of the
+/// merge lattice involving Inconclusive so a regression that
+/// inverts the ordering surfaces immediately.
+///
+/// Each sub-case constructs two AssertResults, merges them
+/// commutatively (lhs+rhs AND rhs+lhs), and asserts the verdict.
+/// The commutative half catches any non-symmetric short-circuit
+/// (e.g. an early `if self.is_fail() return` that would mask
+/// regressions when Inconclusive appears on the right).
+#[test]
+fn merge_inconclusive_precedence() {
+    fn merged(lhs: AssertResult, rhs: AssertResult) -> AssertResult {
+        let mut a = lhs;
+        a.merge(rhs);
+        a
+    }
+    fn mk_pass() -> AssertResult {
+        AssertResult::pass()
+    }
+    fn mk_skip() -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.record_skip("s");
+        r
+    }
+    fn mk_inconc() -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.record_inconclusive(AssertDetail::new(DetailKind::Other, "i"));
+        r
+    }
+    fn mk_fail() -> AssertResult {
+        let mut r = AssertResult::pass();
+        r.record_fail(AssertDetail::new(DetailKind::Other, "f"));
+        r
+    }
+
+    // Pass + Inconclusive => Inconclusive (both orders).
+    let pi = merged(mk_pass(), mk_inconc());
+    assert!(pi.is_inconclusive() && !pi.is_fail() && !pi.is_pass());
+    let ip = merged(mk_inconc(), mk_pass());
+    assert!(ip.is_inconclusive() && !ip.is_fail() && !ip.is_pass());
+
+    // Skip + Inconclusive => Inconclusive (Inconclusive > Skip).
+    let si = merged(mk_skip(), mk_inconc());
+    assert!(si.is_inconclusive() && !si.is_skip() && !si.is_fail());
+    let is_ = merged(mk_inconc(), mk_skip());
+    assert!(is_.is_inconclusive() && !is_.is_skip() && !is_.is_fail());
+
+    // Fail + Inconclusive => Fail (Fail > Inconclusive).
+    let fi = merged(mk_fail(), mk_inconc());
+    assert!(fi.is_fail() && !fi.is_inconclusive() && !fi.is_pass());
+    let if_ = merged(mk_inconc(), mk_fail());
+    assert!(if_.is_fail() && !if_.is_inconclusive() && !if_.is_pass());
+
+    // Inconclusive + Inconclusive => Inconclusive, both extend.
+    let ii = merged(mk_inconc(), mk_inconc());
+    assert!(ii.is_inconclusive() && !ii.is_fail() && !ii.is_pass());
+    assert_eq!(
+        ii.outcomes.len(),
+        2,
+        "both Inconclusive outcomes extend the merged vec"
+    );
+}
+
+#[test]
+fn assert_result_merge_combines_stats() {
+    let mut a = AssertResult {
+        outcomes: vec![Outcome::Fail(AssertDetail::new(DetailKind::Other, "a"))],
+        passes: vec![],
+        stats: ScenarioStats {
+            cgroups: vec![],
+            total_workers: 2,
+            total_cpus: 4,
+            total_migrations: 10,
+            worst_spread: 5.0,
+            worst_gap_ms: 100,
+            worst_gap_cpu: 0,
+            ..Default::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    let b = AssertResult {
+        outcomes: vec![Outcome::Fail(AssertDetail::new(DetailKind::Other, "b"))],
+        passes: vec![],
+        stats: ScenarioStats {
+            cgroups: vec![],
+            total_workers: 3,
+            total_cpus: 6,
+            total_migrations: 20,
+            worst_spread: 15.0,
+            worst_gap_ms: 500,
+            worst_gap_cpu: 2,
+            ..Default::default()
+        },
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    };
+    a.merge(b);
+    assert!(a.is_fail());
+    assert_eq!(
+        a.failure_details()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+    assert_eq!(a.stats.total_workers, 5);
+    assert_eq!(a.stats.total_cpus, 10);
+    assert_eq!(a.stats.total_migrations, 30);
+    assert_eq!(a.stats.worst_spread, 15.0);
+    assert_eq!(a.stats.worst_gap_ms, 500);
+    assert_eq!(a.stats.worst_gap_cpu, 2);
+}
+
+// -- AssertResult::merge ext_metrics --
+
+#[test]
+fn assert_result_merge_ext_metrics_max_value() {
+    let mut a = AssertResult::pass();
+    a.stats.ext_metrics.insert("latency".into(), 10.0);
+    a.stats.ext_metrics.insert("throughput".into(), 100.0);
+
+    let mut b = AssertResult::pass();
+    b.stats.ext_metrics.insert("latency".into(), 20.0);
+    b.stats.ext_metrics.insert("jitter".into(), 5.0);
+
+    a.merge(b);
+    assert_eq!(a.stats.ext_metrics["latency"], 20.0);
+    assert_eq!(a.stats.ext_metrics["throughput"], 100.0);
+    assert_eq!(a.stats.ext_metrics["jitter"], 5.0);
+}
+
+#[test]
+fn assert_result_merge_ext_metrics_keeps_larger() {
+    let mut a = AssertResult::pass();
+    a.stats.ext_metrics.insert("x".into(), 50.0);
+
+    let mut b = AssertResult::pass();
+    b.stats.ext_metrics.insert("x".into(), 30.0);
+
+    a.merge(b);
+    assert_eq!(a.stats.ext_metrics["x"], 50.0);
+}
+
+// -- AssertResult::merge per-phase --
+//
+// Pins the per-step-index phase merge dispatch through
+// `MetricKind::merge_kind`. Counter / Peak / Gauge(Max) /
+// Gauge(Avg) follow the commutative paths; Gauge(Last) /
+// Timestamp use the `end_ms` tiebreak. Unpaired phases (one
+// side only) carry through verbatim per the no-silent-drops
+// contract.
+
+fn phase_bucket(
+    step_index: u16,
+    label: &str,
+    start_ms: u64,
+    end_ms: u64,
+    sample_count: usize,
+    metrics: &[(&str, f64)],
+) -> PhaseBucket {
+    PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index,
+        label: label.to_string(),
+        start_ms,
+        end_ms,
+        sample_count,
+        metrics: metrics
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect(),
+    }
+}
+
+#[test]
+fn assert_result_merge_per_phase_counter_sums() {
+    // `total_migrations` is `MetricKind::Counter`; the per-phase
+    // merge sums the two reduced values so multiple cgroups'
+    // per-phase deltas accumulate.
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("total_migrations", 25.0)],
+    )];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("total_migrations", 75.0)],
+    )];
+    a.merge(b);
+    assert_eq!(a.stats.phases.len(), 1);
+    assert_eq!(a.stats.phases[0].metrics["total_migrations"], 100.0);
+}
+
+#[test]
+fn assert_result_merge_per_phase_peak_takes_max() {
+    // `worst_gap_ms` is `MetricKind::Peak`; the per-phase merge
+    // takes the max so a worse peak on either side wins.
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![phase_bucket(
+        2,
+        "Step[1]",
+        0,
+        100,
+        5,
+        &[("worst_gap_ms", 12.0)],
+    )];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![phase_bucket(
+        2,
+        "Step[1]",
+        0,
+        100,
+        5,
+        &[("worst_gap_ms", 7.0)],
+    )];
+    a.merge(b);
+    assert_eq!(a.stats.phases[0].metrics["worst_gap_ms"], 12.0);
+}
+
+#[test]
+fn assert_result_merge_per_phase_per_cgroup_unions_and_folds() {
+    use crate::assert::PhaseCgroupStats;
+    use std::collections::BTreeSet;
+    // Two same-step buckets. cg_0 is shared — its RAW components FOLD by class:
+    // sample Vecs (latencies/run_delays/off_cpu_pcts) CONCAT, cpus_used UNIONs,
+    // genuine counters (num_workers, migrations, iterations, cpu time, numa
+    // pages, wake_sample_total) SUM — num_workers included, because two carriers
+    // for one cgroup name are per-handle subsets covering DISJOINT workers — and
+    // the one Peak cross_node_migrated [system-wide vmstat delta] takes MAX while
+    // the coupled gap takes ARGMAX. cg_x (shared) pins not-measured (empty
+    // off_cpu_pcts) UNION measured. cg_a/cg_b are one-sided and carried verbatim
+    // BY VALUE. Pins the per_cgroup union in merge_matched_phase_buckets.
+    let mut a = AssertResult::pass();
+    let mut a_bucket = phase_bucket(1, "Step[0]", 0, 100, 5, &[]);
+    a_bucket.per_cgroup.insert(
+        "cg_0".to_string(),
+        PhaseCgroupStats {
+            num_workers: 4,
+            cpus_used: BTreeSet::from([0, 1]),
+            wake_latencies_ns: vec![10, 20],
+            wake_sample_total: 2,
+            run_delays_ns: vec![1_000],
+            off_cpu_pcts: vec![5.0, 20.0],
+            total_migrations: 3,
+            total_iterations: 100,
+            total_cpu_time_ns: 1_000,
+            numa_pages_local: 90,
+            numa_pages_total: 100,
+            cross_node_migrated: 100,
+            max_gap_ms: 7,
+            max_gap_cpu: 3,
+            stripped: false,
+        },
+    );
+    a_bucket.per_cgroup.insert(
+        "cg_x".to_string(),
+        PhaseCgroupStats {
+            off_cpu_pcts: vec![], // not measured on a's side
+            ..Default::default()
+        },
+    );
+    a_bucket.per_cgroup.insert(
+        "cg_a".to_string(),
+        PhaseCgroupStats {
+            num_workers: 1,
+            ..Default::default()
+        },
+    );
+    a.stats.phases = vec![a_bucket];
+
+    let mut b = AssertResult::pass();
+    let mut b_bucket = phase_bucket(1, "Step[0]", 0, 100, 5, &[]);
+    b_bucket.per_cgroup.insert(
+        "cg_0".to_string(),
+        PhaseCgroupStats {
+            num_workers: 4,
+            cpus_used: BTreeSet::from([1, 2]),
+            wake_latencies_ns: vec![30],
+            wake_sample_total: 1,
+            run_delays_ns: vec![2_000, 3_000],
+            off_cpu_pcts: vec![3.0, 15.0],
+            total_migrations: 2,
+            total_iterations: 50,
+            total_cpu_time_ns: 500,
+            numa_pages_local: 40,
+            numa_pages_total: 50,
+            cross_node_migrated: 50,
+            max_gap_ms: 9,
+            max_gap_cpu: 5,
+            stripped: false,
+        },
+    );
+    b_bucket.per_cgroup.insert(
+        "cg_x".to_string(),
+        PhaseCgroupStats {
+            off_cpu_pcts: vec![7.0], // measured on b's side
+            ..Default::default()
+        },
+    );
+    b_bucket.per_cgroup.insert(
+        "cg_b".to_string(),
+        PhaseCgroupStats {
+            num_workers: 2,
+            ..Default::default()
+        },
+    );
+    b.stats.phases = vec![b_bucket];
+
+    a.merge(b);
+    let pc = &a.stats.phases[0].per_cgroup;
+    // One-sided cgroups carried verbatim BY VALUE (not just key presence).
+    assert_eq!(pc["cg_a"].num_workers, 1, "cg_a (a-only) carried by value");
+    assert_eq!(pc["cg_b"].num_workers, 2, "cg_b (b-only) carried by value");
+    // Shared cg_0 folded component-wise.
+    let cg0 = &pc["cg_0"];
+    assert_eq!(cg0.wake_latencies_ns, vec![10, 20, 30], "latencies concat");
+    assert_eq!(cg0.wake_sample_total, 3, "wake_sample_total sums");
+    assert_eq!(
+        cg0.run_delays_ns,
+        vec![1_000, 2_000, 3_000],
+        "run_delays concat (raw ns)"
+    );
+    assert_eq!(
+        cg0.off_cpu_pcts,
+        vec![5.0, 20.0, 3.0, 15.0],
+        "off_cpu_pcts concat (mean + spread re-pool from these raw samples)",
+    );
+    assert_eq!(cg0.cpus_used, BTreeSet::from([0, 1, 2]), "cpus_used union");
+    assert_eq!(cg0.total_migrations, 5, "migrations sum (3+2)");
+    assert_eq!(cg0.total_iterations, 150, "iterations sum (100+50)");
+    assert_eq!(cg0.total_cpu_time_ns, 1_500, "cpu time sum (1000+500)");
+    assert_eq!(cg0.numa_pages_local, 130, "numa_pages_local sum (90+40)");
+    assert_eq!(cg0.numa_pages_total, 150, "numa_pages_total sum (100+50)");
+    assert_eq!(
+        cg0.cross_node_migrated, 100,
+        "cross_node_migrated MAX(100,50)=100 NOT 150 — system-wide vmstat delta",
+    );
+    // Coupled worst gap folds as an ARGMAX: b has the larger gap (9 > 7) so
+    // BOTH ms and cpu come from b — never desynced into a's cpu.
+    assert_eq!(
+        cg0.max_gap_ms, 9,
+        "gap ms = argmax-by-ms(7@cpu3, 9@cpu5) = 9"
+    );
+    assert_eq!(
+        cg0.max_gap_cpu, 5,
+        "gap cpu coupled to the winning gap (b's 5, NOT a's 3)",
+    );
+    assert_eq!(
+        cg0.num_workers, 8,
+        "num_workers SUMs (4+4) — a Counter over disjoint per-handle worker \
+         subsets, not a Peak",
+    );
+    // Not-measured (empty) UNION measured = measured (empty concat is a no-op).
+    assert_eq!(
+        pc["cg_x"].off_cpu_pcts,
+        vec![7.0],
+        "empty off_cpu_pcts (not measured) ∪ measured = measured",
+    );
+}
+
+/// Cross-STEP per_cgroup survival through `AssertResult::merge`: two DIFFERENT
+/// step_index carriers (step 1 cgA, step 2 cgB) BOTH reach the merged output via
+/// the unpaired-step-index arm. This is the cross-phase core invariant — each
+/// step's per_cgroup survives the guest-side merge, not just a single matched
+/// step. The per_cgroup union test above only exercises a SINGLE matched
+/// step_index; this pins the unpaired (different-step) path carries per_cgroup.
+#[test]
+fn assert_result_merge_keeps_per_cgroup_across_distinct_steps() {
+    use crate::assert::{PhaseBucket, PhaseCgroupStats};
+    let bucket = |idx: u16, name: &str, iters: u64| {
+        let mut pc = std::collections::BTreeMap::new();
+        pc.insert(
+            name.to_string(),
+            PhaseCgroupStats {
+                total_iterations: iters,
+                ..Default::default()
+            },
+        );
+        PhaseBucket {
+            step_index: idx,
+            label: format!("Step[{}]", idx - 1),
+            start_ms: 0,
+            end_ms: 100,
+            sample_count: 0,
+            metrics: std::collections::BTreeMap::new(),
+            per_cgroup: pc,
+        }
+    };
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![bucket(1, "cgA", 11)];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![bucket(2, "cgB", 22)];
+    a.merge(b);
+    assert_eq!(
+        a.stats.phases.len(),
+        2,
+        "both distinct-step buckets survive"
+    );
+    let s1 = a
+        .stats
+        .phases
+        .iter()
+        .find(|p| p.step_index == 1)
+        .expect("step 1 survives");
+    let s2 = a
+        .stats
+        .phases
+        .iter()
+        .find(|p| p.step_index == 2)
+        .expect("step 2 survives");
+    assert_eq!(
+        s1.per_cgroup["cgA"].total_iterations, 11,
+        "step 1 per_cgroup carried"
+    );
+    assert_eq!(
+        s2.per_cgroup["cgB"].total_iterations, 22,
+        "step 2 per_cgroup carried"
+    );
+}
+
+#[test]
+fn assert_result_merge_per_phase_gauge_last_takes_later_end_ms() {
+    // `worst_spread` is `MetricKind::Gauge(GaugeAgg::Last)`. The
+    // per-phase merge resolves to the value from the bucket with
+    // the later `end_ms` per `MergeKind::NonCommutative`. The
+    // arrival order doesn't decide the winner — the timestamp does.
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        200,
+        5,
+        &[("worst_spread", 0.42)],
+    )];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("worst_spread", 0.11)],
+    )];
+    a.merge(b);
+    // a.end_ms = 200 > b.end_ms = 100 → a's value wins.
+    assert_eq!(a.stats.phases[0].metrics["worst_spread"], 0.42);
+    // Merged window covers both: start_ms = min, end_ms = max.
+    assert_eq!(a.stats.phases[0].start_ms, 0);
+    assert_eq!(a.stats.phases[0].end_ms, 200);
+}
+
+#[test]
+fn assert_result_merge_per_phase_gauge_last_reverse_picks_later_end_ms() {
+    // Same metric, opposite end_ms ordering — verifies the
+    // NonCommutative tiebreak follows the timestamp, not the
+    // operand order. `b` has the later `end_ms` so b's value wins
+    // even though it's on the right side of the merge.
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("worst_spread", 0.42)],
+    )];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        200,
+        5,
+        &[("worst_spread", 0.11)],
+    )];
+    a.merge(b);
+    // b.end_ms = 200 > a.end_ms = 100 → b's value wins.
+    assert_eq!(a.stats.phases[0].metrics["worst_spread"], 0.11);
+    assert_eq!(a.stats.phases[0].end_ms, 200);
+}
+
+#[test]
+fn assert_result_merge_per_phase_unpaired_step_indices_keep_both() {
+    // One side has step_index 1, the other has step_index 2. The
+    // merge keeps both — no-silent-drops contract.
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        3,
+        &[("total_migrations", 5.0)],
+    )];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![phase_bucket(
+        2,
+        "Step[1]",
+        100,
+        200,
+        3,
+        &[("total_migrations", 8.0)],
+    )];
+    a.merge(b);
+    assert_eq!(a.stats.phases.len(), 2);
+    // Sorted by step_index for deterministic output.
+    assert_eq!(a.stats.phases[0].step_index, 1);
+    assert_eq!(a.stats.phases[1].step_index, 2);
+    assert_eq!(a.stats.phases[0].metrics["total_migrations"], 5.0);
+    assert_eq!(a.stats.phases[1].metrics["total_migrations"], 8.0);
+}
+
+#[test]
+fn assert_result_merge_per_phase_unknown_metric_takes_mean() {
+    // Unregistered metric name → fallback to arithmetic mean. The
+    // safest commutative default when the merge can't query
+    // `MetricKind`.
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![phase_bucket(
+        0,
+        "BASELINE",
+        0,
+        100,
+        5,
+        &[("custom.metric", 10.0)],
+    )];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![phase_bucket(
+        0,
+        "BASELINE",
+        0,
+        100,
+        5,
+        &[("custom.metric", 30.0)],
+    )];
+    a.merge(b);
+    assert_eq!(a.stats.phases[0].metrics["custom.metric"], 20.0);
+}
+
+#[test]
+fn assert_result_merge_per_phase_one_side_only_keeps_value() {
+    // Metric present on one side only inside an otherwise-paired
+    // step_index. The merge takes the available value (no fold
+    // against a missing operand).
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("total_migrations", 7.0), ("worst_gap_ms", 12.0)],
+    )];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![phase_bucket(
+        1,
+        "Step[0]",
+        0,
+        100,
+        5,
+        &[("total_migrations", 3.0)],
+    )];
+    a.merge(b);
+    assert_eq!(a.stats.phases[0].metrics["total_migrations"], 10.0);
+    assert_eq!(a.stats.phases[0].metrics["worst_gap_ms"], 12.0);
+}
+
+#[test]
+fn assert_result_merge_per_phase_window_invariants() {
+    // start_ms = min, end_ms = max, sample_count = sum across
+    // both sides. The merged window spans every sample reported
+    // by either side.
+    let mut a = AssertResult::pass();
+    a.stats.phases = vec![phase_bucket(1, "Step[0]", 50, 150, 4, &[])];
+    let mut b = AssertResult::pass();
+    b.stats.phases = vec![phase_bucket(1, "Step[0]", 10, 200, 6, &[])];
+    a.merge(b);
+    assert_eq!(a.stats.phases[0].start_ms, 10);
+    assert_eq!(a.stats.phases[0].end_ms, 200);
+    assert_eq!(a.stats.phases[0].sample_count, 10);
+}
+
+#[test]
+fn merge_kind_enum_exhaustively_covers_metric_kind_variants() {
+    // Every `MetricKind` must map to a `MergeKind` via
+    // `MetricKind::merge_kind`. Exercising every variant here
+    // means a new `MetricKind` addition either compiles (variant
+    // listed in `merge_kind`'s exhaustive match) or fails the
+    // build at that match site — never silently falls through to
+    // a wrong default.
+    use crate::stats::{GaugeAgg, MergeKind, MetricKind};
+    assert_eq!(MetricKind::Counter.merge_kind(), MergeKind::Commutative);
+    assert_eq!(MetricKind::Peak.merge_kind(), MergeKind::Commutative);
+    assert_eq!(
+        MetricKind::Gauge(GaugeAgg::Avg).merge_kind(),
+        MergeKind::Commutative,
+    );
+    assert_eq!(
+        MetricKind::Gauge(GaugeAgg::Max).merge_kind(),
+        MergeKind::Commutative,
+    );
+    assert_eq!(
+        MetricKind::Gauge(GaugeAgg::Last).merge_kind(),
+        MergeKind::NonCommutative,
+    );
+    assert_eq!(
+        MetricKind::Timestamp.merge_kind(),
+        MergeKind::NonCommutative,
+    );
+    assert_eq!(MetricKind::DeltaSum.merge_kind(), MergeKind::Commutative);
+    assert_eq!(
+        MetricKind::Rate {
+            numerator: "n",
+            denominator: "d",
+        }
+        .merge_kind(),
+        MergeKind::Recompute,
+    );
+}
+
+/// merge_matched_phase_buckets must INCLUDE a synthesized
+/// (sample_count==0) bucket's capture-independent iteration_rate when
+/// merging it against a captured bucket at the same step_index. Since
+/// iteration_rate is a MetricKind::Rate, the merge sums each side's
+/// Counter components (total_phase_iterations / total_phase_duration_sec)
+/// and re-derives the rate as Σiters/Σseconds — so the synthesized side's
+/// iterations are pooled in, never dropped. Guards the no-silent-drops
+/// invariant for any cross-result phase merge (e.g. the per-cgroup
+/// phase-bucket fold). Unequal durations make the re-pool (450) distinct
+/// from a mean-of-ratios (500) and a dropped-synthesized result (400).
+#[test]
+fn merge_matched_phase_buckets_repools_synthesized_zero_count() {
+    use std::collections::BTreeMap;
+    let synth = PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index: 2,
+        label: "Step[1]".to_string(),
+        start_ms: 2000,
+        end_ms: 3000,
+        sample_count: 0, // synthesized zero-capture bucket: 600 iters / 1s
+        metrics: BTreeMap::from([
+            ("total_phase_iterations".to_string(), 600.0),
+            ("total_phase_duration_sec".to_string(), 1.0),
+        ]),
+    };
+    let captured = PhaseBucket {
+        per_cgroup: Default::default(),
+        step_index: 2,
+        label: "Step[1]".to_string(),
+        start_ms: 2000,
+        end_ms: 3000,
+        sample_count: 5, // 1200 iters / 3s
+        metrics: BTreeMap::from([
+            ("total_phase_iterations".to_string(), 1200.0),
+            ("total_phase_duration_sec".to_string(), 3.0),
+        ]),
+    };
+    let merged = merge_matched_phase_buckets(synth, captured);
+    // Re-pool: Σiters / Σseconds = (600 + 1200) / (1 + 3) = 1800/4 = 450/s.
+    // The synthesized side's 600 iters are SUMMED in (Counter merge), so
+    // 450 — NOT 400 (synthesized dropped, captured 1200/3) and NOT 500
+    // (mean of the two ready ratios 600 and 400).
+    let r = merged
+        .metrics
+        .get("iteration_rate")
+        .copied()
+        .expect("merged bucket carries the re-derived iteration_rate");
+    assert!(
+        (r - 450.0).abs() < f64::EPSILON,
+        "synthesized rate's iterations must pool into Σiters/Σseconds = 450, \
+         not be dropped (400) or averaged as ratios (500); got {r}",
+    );
+    assert_eq!(
+        merged.metrics.get("total_phase_iterations").copied(),
+        Some(1800.0),
+        "iteration components sum across the merged buckets",
+    );
+}

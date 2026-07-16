@@ -1,0 +1,5 @@
+error: expected float literal for max_spread_pct
+ --> tests/compile_fail/ktstr_test_float_not_float.rs:3:31
+  |
+3 | #[ktstr_test(max_spread_pct = "high")]
+  |                               ^^^^^^

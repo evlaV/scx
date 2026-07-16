@@ -1,0 +1,5 @@
+error: expected array of string literals for extra_sched_args
+ --> tests/compile_fail/ktstr_test_extra_sched_args_not_array.rs:3:33
+  |
+3 | #[ktstr_test(extra_sched_args = "not-an-array")]
+  |                                 ^^^^^^^^^^^^^^

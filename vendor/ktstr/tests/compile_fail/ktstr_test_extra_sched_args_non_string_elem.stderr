@@ -1,0 +1,5 @@
+error: expected string literal in extra_sched_args
+ --> tests/compile_fail/ktstr_test_extra_sched_args_non_string_elem.rs:3:34
+  |
+3 | #[ktstr_test(extra_sched_args = [42])]
+  |                                  ^^

@@ -1,0 +1,1971 @@
+//! Guest-output and console parsing for ktstr test results.
+//!
+//! Every VM-hosted `#[ktstr_test]` run emits these distinguishable
+//! streams that the host must parse before it can judge pass/fail or
+//! surface useful diagnostics:
+//!
+//! - **AssertResult postcard** on the bulk data channel under
+//!   `MSG_TYPE_TEST_RESULT`. See [`print_assert_result`] (guest
+//!   emit) and [`parse_assert_result_from_drain`] (host parse).
+//!   The wire format is postcard v1
+//!   so guest and host stay in lock-step on the encoding choice.
+//! - **Scheduler log** in `MSG_TYPE_SCHED_LOG` chunks on the bulk
+//!   data channel. The chunks carry the
+//!   [`SCHED_OUTPUT_START`](crate::verifier::SCHED_OUTPUT_START) /
+//!   [`SCHED_OUTPUT_END`](crate::verifier::SCHED_OUTPUT_END) markers
+//!   verbatim (defined in [`crate::verifier`] since that is the
+//!   primary host-side consumer that also parses the BPF verifier
+//!   log carried inside the block).
+//!   [`crate::verifier::parse_sched_output`]
+//!   extracts the block; [`sched_log_fingerprint`] returns the last
+//!   non-empty line as a failure fingerprint so duplicate failures
+//!   cluster visually in nextest output.
+//! - **sched_ext dump** on COM1 (kernel trace_pipe). Parsed by
+//!   [`extract_sched_ext_dump`] — it filters lines containing
+//!   `sched_ext_dump` out of the raw trace stream.
+//!
+//! Supporting helpers:
+//! - [`extract_kernel_version`] reads the `Linux version X.Y.Z ...`
+//!   line from boot output.
+//! - [`extract_panic_message`] pulls the guest's `PANIC:` line (the
+//!   Rust panic hook in `rust_init/init.rs` still writes these to COM2
+//!   because the panic hook cannot block on virtio backpressure;
+//!   every other guest stream now travels over the bulk port).
+//! - [`classify_init_stage`] walks the bucketed lifecycle phase
+//!   vec to pinpoint where in the init lifecycle a silent failure
+//!   happened.
+//! - [`format_console_diagnostics`] composes the `--- diagnostics ---`
+//!   block appended to failed-test error output.
+
+use anyhow::{Context, Result};
+
+use crate::assert::AssertResult;
+use crate::verifier::parse_sched_output;
+use crate::vmm;
+
+/// Emit AssertResult to the host over the bulk data channel
+/// (`MSG_TYPE_TEST_RESULT`) using postcard v1. The encoding
+/// choice is paired with the host's
+/// [`parse_assert_result_from_drain`] decoder so layout never
+/// diverges.
+///
+/// Pre-1.0: the legacy COM2 `RESULT_START` / `RESULT_END` JSON
+/// fallback is gone — bulk port is the only transport.
+pub(crate) fn print_assert_result(r: &AssertResult) {
+    vmm::guest_comms::send_test_result(r);
+}
+
+/// Extract AssertResult from a bulk-drain entries.
+///
+/// Walks entries in reverse so the last-emitted (most recent)
+/// `MSG_TYPE_TEST_RESULT` frame wins — matches the existing
+/// "latest wins" semantics for the primary transport.
+pub(crate) fn parse_assert_result_from_drain(
+    drain: Option<&vmm::host_comms::BulkDrainResult>,
+) -> Result<AssertResult> {
+    let drain = drain.ok_or_else(|| anyhow::anyhow!("no guest messages"))?;
+    let entry = drain
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.msg_type == vmm::wire::MSG_TYPE_TEST_RESULT && e.crc_ok)
+        .ok_or_else(|| anyhow::anyhow!("no test result in guest messages"))?;
+    let result = postcard::from_bytes::<AssertResult>(&entry.payload)
+        .context("decode AssertResult postcard payload from drain")?;
+    Ok(result)
+}
+
+/// Extract the last non-empty line from the scheduler log.
+///
+/// This serves as a failure fingerprint: when many tests fail with the
+/// same scheduler error, the fingerprint makes identical failures
+/// visually obvious in nextest output.
+pub(crate) fn sched_log_fingerprint(output: &str) -> Option<&str> {
+    let log = parse_sched_output(output)?;
+    log.lines().rev().find(|l| !l.trim().is_empty())
+}
+
+/// Extract sched_ext_dump lines from COM1 kernel console (trace_pipe output).
+///
+/// The trace_pipe stream contains lines with `sched_ext_dump:` prefixes when
+/// a SysRq-D dump is triggered. Collects all such lines into a single string.
+/// Returns `None` if no dump lines are present.
+///
+/// Matches the literal `sched_ext_dump:` marker (the trailing colon is part
+/// of the ftrace event format `<event_name>: <body>` and the dmesg printk
+/// format `[<ts>] sched_ext_dump: <body>`). The colon anchors the match so
+/// an unrelated kernel printk that mentions the substring `sched_ext_dump`
+/// without the trailing colon does not get pulled into the dump section.
+pub(crate) fn extract_sched_ext_dump(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|l| l.contains(super::probe::SCHED_EXT_DUMP_MARKER))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+/// Extract a one-line "BUG SUMMARY" from the scheduler log and the
+/// sched_ext dump for top-of-stderr placement on test failure.
+///
+/// Primary anchor: the kernel's scheduler-exit emission at
+/// `kernel/sched/ext.c:6161-6163` produces
+///
+/// ```text
+/// <task>[<pid>] triggered exit kind <N>:
+///   <reason> (<msg>)
+/// ```
+///
+/// routed through the `sched_ext_dump` tracepoint so each line in the
+/// trace_pipe stream carries a `<task>  [<cpu>]  <ts>: sched_ext_dump: `
+/// prefix. The scan locates the `triggered exit kind` anchor and walks
+/// forward for the first SAME-CPU line that isn't itself another
+/// anchor; the body (everything after `sched_ext_dump:`, trimmed) of
+/// that line is returned. Same-CPU is required because the kernel
+/// emits anchor and body via two adjacent `dump_line` calls under
+/// `scx_dump_lock` from one CPU context — but `trace_pipe` merges
+/// per-CPU ring buffers, so unrelated tracepoint events fired from
+/// OTHER CPUs can land between anchor and body in the stream. Anchors
+/// with no `[<cpu>]` prefix (synthetic test fixtures without
+/// trace_pipe framing) fall back to strict adjacency.
+///
+/// Fallback: when no `triggered exit kind` anchor is present in the
+/// dump (truncated console, pre-attach failure, etc.), scan the
+/// scheduler log for the first line containing `scx_bpf_error` —
+/// the userspace prefix scheduler binaries emit before kernel
+/// exits. The matched line is returned trimmed.
+///
+/// First-wins: when multiple `triggered exit kind` events appear
+/// (rapid load+disable cycles per `dmesg_scx.rs:157-159`), the
+/// first is returned. Closer-event lines
+/// (`sched_ext: ... disabled (...)`) do NOT match — they describe
+/// the disable, not the trigger that caused it.
+///
+/// ANSI CSI escape sequences are stripped from BOTH inputs before
+/// the substring scan, so a scheduler binary that emits colored
+/// logs does not break extraction. The returned `String` never
+/// contains ANSI escapes.
+///
+/// Returns `None` when no actionable text is found OR when the
+/// extracted text trims to empty — suppresses a noisy top-of-stderr
+/// `BUG SUMMARY:` line when there is no bug to summarize.
+pub(crate) fn extract_bug_summary(sched_log: &str, dump: &str) -> Option<String> {
+    let dump_clean = strip_ansi_csi(dump);
+    let lines: Vec<&str> = dump_clean.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("triggered exit kind")
+            && let Some(next) = find_same_cpu_body_after(&lines, i, parse_trace_cpu(line))
+        {
+            let body = next
+                .find("sched_ext_dump:")
+                .map(|p| &next[p + "sched_ext_dump:".len()..])
+                .unwrap_or(next)
+                .trim();
+            if !body.is_empty() {
+                return Some(body.to_string());
+            }
+        }
+    }
+    let sched_clean = strip_ansi_csi(sched_log);
+    for line in sched_clean.lines() {
+        if line.contains("scx_bpf_error") {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Walk forward from `lines[after]` for the first SAME-CPU line that
+/// isn't itself another `triggered exit kind` anchor.
+///
+/// Both [`extract_bug_summary`] and [`extract_exit_from_dump_trace`]
+/// share the kernel emission contract — anchor and body emitted via
+/// two adjacent `dump_line` calls under `scx_dump_lock` from one CPU
+/// context (kernel/sched/ext.c). `trace_pipe`, however, merges per-CPU
+/// ring buffers — so unrelated tracepoint events fired from OTHER
+/// CPUs between the two `dump_line` calls land BETWEEN anchor and
+/// body in the stream. A strict `lines.get(i + 1)` pick would then
+/// return the cross-CPU interleaved event as the body. Scanning
+/// forward for the first same-CPU line skips those interleaved events.
+///
+/// Stops at the next anchor on the same CPU — the first anchor's
+/// body was lost (truncation or dump_line failure) and must not adopt
+/// the following anchor's data as its body.
+///
+/// When `anchor_cpu` is `None` (synthetic test fixtures without
+/// trace_pipe framing), the same-CPU filter is bypassed and the first
+/// non-anchor subsequent line is returned — matches strict-adjacency
+/// behavior for inputs without the tracepoint envelope.
+fn find_same_cpu_body_after<'a>(
+    lines: &[&'a str],
+    after: usize,
+    anchor_cpu: Option<&str>,
+) -> Option<&'a str> {
+    lines
+        .iter()
+        .skip(after + 1)
+        .filter(|n| anchor_cpu.is_none() || parse_trace_cpu(n) == anchor_cpu)
+        .take_while(|n| !n.contains("triggered exit kind"))
+        .next()
+        .copied()
+}
+
+/// Parse the `[<cpu>]` prefix from a trace_pipe line.
+///
+/// The trace_pipe format is `<task>-<pid> [<cpu>] <time>: <event>:
+/// <event-data>`. The CPU bracket sits between the task-pid prefix
+/// and the timestamp, well before any `scheduler[N]` mention in the
+/// event data. To avoid matching `scheduler[5678]` or other digit-
+/// bracketed tokens that appear later in the line, the parse only
+/// looks at the slice BEFORE `: sched_ext_dump:`. Within that slice
+/// the parse uses `rfind('[')` (not `find`) so a pathological task
+/// name containing `[` (kthread-style brackets, exotic comm strings)
+/// can't shadow the CPU bracket — the CPU bracket is always the
+/// LAST bracketed token before the timestamp. The inner bytes must
+/// be 1-5 ASCII digits (NR_CPUS today caps at 8192 = 4 digits; 5
+/// gives headroom). Returns `None` for lines without trace_pipe
+/// framing (e.g. raw kernel logs, or synthetic test inputs without
+/// the tracepoint envelope).
+fn parse_trace_cpu(line: &str) -> Option<&str> {
+    let event_pos = line.find(": sched_ext_dump:")?;
+    let prefix = &line[..event_pos];
+    let bracket_open = prefix.rfind('[')?;
+    let bracket_close = bracket_open + 1 + prefix[bracket_open + 1..].find(']')?;
+    let inner = &prefix[bracket_open + 1..bracket_close];
+    if inner.is_empty() || inner.len() > 5 || !inner.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(&prefix[bracket_open..=bracket_close])
+}
+
+/// Strip ANSI CSI escape sequences (`\x1b[...<letter>`) from a
+/// string. Used by [`extract_bug_summary`] so a colorized
+/// scheduler-log line does not break the substring scan. Bytes
+/// outside CSI sequences pass through unchanged.
+fn strip_ansi_csi(s: &str) -> String {
+    // Common case: no ESC byte at all — return without allocating
+    // a separate Vec + roundtripping through from_utf8. Called up
+    // to twice per test failure via `extract_bug_summary` — once
+    // on the dump arg (unconditionally), and again on the
+    // sched_log arg if the dump anchor scan doesn't return. The
+    // `crate::test_support::eval` pre-compute was lifted into a
+    // closure that only fires on failure paths, so passing tests
+    // no longer hit
+    // this; the fast path avoids unnecessary copy/strip work
+    // when the corpus is plain text.
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            i = j.saturating_add(1);
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // `out` is byte-for-byte copies from a valid &str MINUS
+    // 7-bit ASCII CSI sequences. Multi-byte UTF-8 sequences are
+    // never inside CSI (their continuation bytes 0x80-0xbf can't
+    // appear in CSI bodies which only use 0x20-0x3f params /
+    // intermediates and 0x40-0x7e terminators), so the skipped
+    // ranges never split a multi-byte codepoint. The result is
+    // guaranteed valid UTF-8.
+    String::from_utf8(out).expect("strip_ansi_csi preserves UTF-8")
+}
+
+/// Extract exit reason from `sched_ext_dump:` trace lines when the
+/// `sched_ext: BPF scheduler "..." disabled (...)` anchor line is
+/// absent (truncated console). Looks for `triggered exit kind NNNN:`
+/// followed by the reason text on the same-CPU dump line.
+///
+/// Uses [`find_same_cpu_body_after`] for the same reason as
+/// [`extract_bug_summary`]: the kernel emits anchor and body via two
+/// adjacent `dump_line` calls under `scx_dump_lock`, but `trace_pipe`
+/// merges per-CPU buffers and unrelated tracepoint events fired from
+/// OTHER CPUs can land between them in the stream. Strict adjacency
+/// would surface the wrong scheduler's data; same-CPU scan skips the
+/// interleaved events.
+pub(crate) fn extract_exit_from_dump_trace(console: &str) -> Option<String> {
+    let lines: Vec<&str> = console.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("sched_ext_dump:")
+            && line.contains("triggered exit kind")
+            && let Some(next) = find_same_cpu_body_after(&lines, i, parse_trace_cpu(line))
+            && let Some(pos) = next.find("sched_ext_dump:")
+        {
+            let body = next[pos + "sched_ext_dump:".len()..].trim();
+            if !body.is_empty() {
+                return Some(body.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract kernel version from console output (COM1/stderr).
+///
+/// Looks for "Linux version X.Y.Z..." in boot messages.
+pub(crate) fn extract_kernel_version(console: &str) -> Option<String> {
+    for line in console.lines() {
+        if let Some(rest) = line.split("Linux version ").nth(1) {
+            return Some(rest.split_whitespace().next().unwrap_or("").to_string());
+        }
+    }
+    None
+}
+
+/// Extract the panic message from guest COM2 output.
+///
+/// Looks for a line whose trimmed form starts with `PANIC:` (the
+/// prefix the guest panic hook in `rust_init/init.rs` writes verbatim).
+/// Returns the text after the prefix with leading whitespace
+/// trimmed; returns `None` when no panic line is present.
+///
+/// The match deliberately requires the prefix to anchor at the
+/// start of a (trimmed) line. A `.contains("PANIC:")` would also
+/// match unrelated mid-line occurrences — a console log that
+/// happened to mention the literal text "PANIC:" inside an info
+/// message ("expected PANIC: from this test") would be
+/// misclassified as the panic line. Guest panic-hook output is
+/// always emitted at the start of a line in `rust_init/init.rs`, so
+/// the prefix anchor is always satisfied for genuine panics.
+pub(crate) fn extract_panic_message(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .map(|l| l.trim())
+        .find_map(|l| l.strip_prefix("PANIC:").map(str::trim_start))
+}
+
+// Pre-bulk-port-migration the guest emitted COM2 sentinel strings
+// (`KTSTR_INIT_STARTED`, `KTSTR_PAYLOAD_STARTING`,
+// `KTSTR_EXIT=<code>`, `KTSTR_EXEC_EXIT=<code>`, `SCHEDULER_DIED`,
+// `SCHEDULER_NOT_ATTACHED: <reason>`) that the host scraped to
+// classify boot phase, exit code, and scheduler-attach failures.
+// All five now travel as typed `MSG_TYPE_LIFECYCLE` /
+// `MSG_TYPE_EXIT` / `MSG_TYPE_EXEC_EXIT` frames on the bulk data
+// port (see `crate::vmm::guest_comms::send_lifecycle`,
+// `send_exit`, and `send_exec_exit`). The `SENTINEL_*` const
+// strings are gone — host code walks
+// `result.guest_messages.entries` and matches on
+// `crate::vmm::wire::LifecyclePhase` / `MSG_TYPE_*` discriminants.
+
+// ---------------------------------------------------------------------------
+// Init-stage classification labels
+// ---------------------------------------------------------------------------
+//
+// Returned by `classify_init_stage` and asserted by `crate::test_support::eval`
+// tests via substring match. Shared constants keep the production label and the
+// test pins from drifting silently.
+
+/// Stage label when no init sentinel appears in COM2 — indicates the
+/// guest kernel or initramfs never reached Rust init. Pinned by
+/// `classify_no_sentinels` (output.rs) and `eval_no_sentinels_shows_initramfs_failure`
+/// (eval/eval_tests_eval.rs).
+pub(crate) const STAGE_INIT_NOT_STARTED: &str =
+    "init script never started (kernel or mount failure)";
+
+/// Stage label when `KTSTR_INIT_STARTED` was written but the payload
+/// sentinel never appeared — cgroup or scheduler setup failed after
+/// filesystem mounts. Pinned by `classify_init_started_only` (output.rs)
+/// and `eval_init_started_but_no_payload` (eval/eval_tests_eval.rs).
+pub(crate) const STAGE_INIT_STARTED_NO_PAYLOAD: &str =
+    "init started but payload never ran (cgroup/scheduler setup failed)";
+
+/// Stage label when `KTSTR_PAYLOAD_STARTING` was written but no
+/// AssertResult JSON followed — the test function entered and then
+/// crashed, hung, or produced no output. Pinned by
+/// `classify_payload_starting` / `classify_payload_starting_without_init`
+/// (output.rs) and `eval_payload_started_no_result` (eval/eval_tests_eval.rs).
+pub(crate) const STAGE_PAYLOAD_STARTED_NO_RESULT: &str =
+    "payload started but produced no test result";
+
+/// Classify the failure stage based on which `MSG_TYPE_LIFECYCLE`
+/// phase events appear in the bulk-port drain.
+///
+/// Pre-bulk-port-migration: read `KTSTR_INIT_STARTED` /
+/// `KTSTR_PAYLOAD_STARTING` substrings from COM2 output. Now the
+/// guest emits each phase as a typed
+/// [`crate::vmm::wire::LifecyclePhase`] frame; the classifier walks
+/// the entries in arrival order and picks the latest known phase,
+/// which is the deepest stage the guest reached before failing.
+///
+/// Returns the matching `STAGE_*` label. `None` drain (the bulk
+/// port produced no entries at all) maps to
+/// [`STAGE_INIT_NOT_STARTED`] — same as the prior "no sentinel
+/// seen" branch.
+pub(crate) fn classify_init_stage(
+    drain: Option<&vmm::host_comms::BulkDrainResult>,
+) -> &'static str {
+    use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE};
+    let Some(drain) = drain else {
+        return STAGE_INIT_NOT_STARTED;
+    };
+    let mut latest: Option<LifecyclePhase> = None;
+    for e in &drain.entries {
+        if e.msg_type != MSG_TYPE_LIFECYCLE || !e.crc_ok || e.payload.is_empty() {
+            continue;
+        }
+        if let Some(phase) = LifecyclePhase::from_wire(e.payload[0]) {
+            latest = Some(phase);
+        }
+    }
+    // Check for PayloadStarting EXPLICITLY via `primary_reached_workload`
+    // rather than relying on `latest` — both `SchedulerDied` and
+    // `SchedulerNotAttached` lifecycle frames fire BEFORE
+    // `PayloadStarting` (the only emit paths are inside
+    // `start_scheduler` in `vmm::rust_init`, which force-reboots
+    // before the phase-5 PayloadStarting emit). A scheduler that
+    // exits POST-PayloadStarting is reported on a different wire
+    // channel (`MsgType::SchedExit`), not as a `LifecyclePhase`
+    // frame. The "deepest stage reached" is about the workload-entry
+    // threshold (PayloadStarting), not about the most-recent
+    // lifecycle frame; lumping the pre-PayloadStarting failure
+    // phases into STAGE_PAYLOAD_STARTED_NO_RESULT was a pre-existing
+    // bug that mislabeled scheduler-attach failures as "workload
+    // ran."
+    if primary_reached_workload(Some(drain)) {
+        return STAGE_PAYLOAD_STARTED_NO_RESULT;
+    }
+    match latest {
+        Some(_) => STAGE_INIT_STARTED_NO_PAYLOAD,
+        None => STAGE_INIT_NOT_STARTED,
+    }
+}
+
+/// True when the primary VM emitted a
+/// [`crate::vmm::wire::LifecyclePhase::PayloadStarting`] frame on
+/// its bulk-port drain — the marker that the test workload was
+/// reached.
+///
+/// The auto-repro pipeline uses this directly as a bool gate (see
+/// `label_repro_verdict_when_workload_not_reached`) rather than
+/// inferring "reached workload?" from
+/// [`classify_init_stage`]'s stage string. The bool form decouples
+/// the auto-repro gate from any future bucketing change in the
+/// stage classifier, so a regression to the classifier can't
+/// silently re-introduce the SchedulerNotAttached-misclassification
+/// bug at the auto-repro site. [`classify_init_stage`] in turn
+/// consumes this helper for its own `PayloadStarting` test, keeping
+/// the two functions on a single source of truth for "did the
+/// workload start?"
+pub(crate) fn primary_reached_workload(drain: Option<&vmm::host_comms::BulkDrainResult>) -> bool {
+    use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE};
+    let Some(drain) = drain else {
+        return false;
+    };
+    drain.entries.iter().any(|e| {
+        e.msg_type == MSG_TYPE_LIFECYCLE
+            && e.crc_ok
+            && !e.payload.is_empty()
+            && LifecyclePhase::from_wire(e.payload[0]) == Some(LifecyclePhase::PayloadStarting)
+    })
+}
+
+/// Format diagnostic info from COM1 kernel console output, VM exit code,
+/// and init stage classification.
+///
+/// Returns an empty string when there is nothing useful to show.
+/// Otherwise returns a section starting with a blank line, containing the
+/// init stage, exit code, and the last few lines of kernel console output.
+pub(crate) fn format_console_diagnostics(
+    console: &str,
+    exit_code: i32,
+    init_stage: &str,
+) -> String {
+    const TAIL_LINES: usize = 20;
+    let trimmed = console.trim();
+    if trimmed.is_empty() && exit_code == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::with_capacity(3);
+    parts.push(format!("stage: {init_stage}"));
+    let exit_label = if exit_code < 0 {
+        // Negative exit codes are typically negated errno values.
+        crate::errno_name(-exit_code)
+            .map(|name| format!("exit_code={exit_code} ({name})"))
+            .unwrap_or_else(|| format!("exit_code={exit_code}"))
+    } else {
+        format!("exit_code={exit_code}")
+    };
+    parts.push(exit_label);
+    if !trimmed.is_empty() {
+        let lines: Vec<&str> = trimmed.lines().collect();
+        // Show all lines when a crash is detected (PANIC: in output),
+        // otherwise show only the last TAIL_LINES.
+        let has_crash = lines.iter().any(|l| l.contains("PANIC:"));
+        let limit = if has_crash { lines.len() } else { TAIL_LINES };
+        let start = lines.len().saturating_sub(limit);
+        let tail = &lines[start..];
+        // Two independent truncation conditions:
+        //   - `window_dropped`: the tail window dropped earlier
+        //     lines (more lines existed than fit in TAIL_LINES).
+        //   - `last_line_incomplete`: the captured stream ends
+        //     without a newline, so the final line is partial.
+        // Conflating these — as a single `truncated` flag — would
+        // claim "truncated" on a complete short console that just
+        // happens to lack a trailing newline (e.g. a line buffer
+        // flushed without `\n`), or hide window truncation behind
+        // the same label as a partial last line. Track and report
+        // them separately so the operator knows whether earlier
+        // boot output went missing or only the final line was cut.
+        let window_dropped = start > 0;
+        let last_line_incomplete = !console.ends_with('\n');
+        let header_suffix = match (window_dropped, last_line_incomplete) {
+            (true, true) => ", window-truncated, last line incomplete",
+            (true, false) => ", window-truncated",
+            (false, true) => ", last line incomplete",
+            (false, false) => "",
+        };
+        let body_suffix = if last_line_incomplete {
+            " [partial]"
+        } else {
+            ""
+        };
+        parts.push(format!(
+            "console ({} lines{}):\n{}{}",
+            tail.len(),
+            header_suffix,
+            tail.join("\n"),
+            body_suffix,
+        ));
+    }
+    format!("\n\n--- diagnostics ---\n{}", parts.join("\n"))
+}
+
+/// Format the `--- periodic samples ---` section for failure
+/// output. Reads `VmResult::periodic_target` and
+/// `VmResult::periodic_fired` to surface the cadence-coverage
+/// ratio plus the per-sample tag list — useful when a temporal
+/// assertion failed and the operator needs to see which periodic
+/// boundary samples were actually captured (vs. skipped due to
+/// rendezvous timeout / abandon thresholds).
+///
+/// Returns an empty string when the entry did not configure
+/// periodic capture (`periodic_target == 0`); under those runs
+/// the section is noise. When periodic capture WAS configured but
+/// produced zero captures, the section still renders to surface
+/// the coverage gap.
+pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String {
+    if result.periodic_target == 0 {
+        return String::new();
+    }
+    let fired = result.periodic_fired;
+    let real = result.periodic_real;
+    let target = result.periodic_target;
+    let mut lines = vec![format!(
+        "fired {fired}/{target} periodic snapshots ({pct:.0}% coverage)",
+        pct = if target == 0 {
+            0.0
+        } else {
+            100.0 * fired as f64 / target as f64
+        }
+    )];
+    // `periodic_fired` counts every attempted boundary, including
+    // rendezvous-timeout placeholders that carry no BPF state. When
+    // some fires were placeholder-only, "100% fired" overstates
+    // usable coverage — surface the real-capture floor so the
+    // operator does not read a degraded run as fully covered.
+    if real < fired {
+        lines.push(format!(
+            "{placeholders} were degraded placeholders \
+             (real BPF-state captures: {real}/{target})",
+            placeholders = fired.saturating_sub(real),
+        ));
+    }
+    // Snapshot tags / elapsed timestamps live on the bridge until
+    // the test author drains it; without draining (which would
+    // consume the bridge) we can only report coverage. The full
+    // per-sample timeline is the test author's job to render via
+    // the SampleSeries API once they drain — the section here
+    // surfaces the gap, not the values.
+    if fired < target {
+        lines.push(format!(
+            "missing {miss} sample(s) — see freeze-coord traces \
+             for skip / timeout reasons",
+            miss = target.saturating_sub(fired),
+        ));
+    }
+    format!("\n\n--- periodic samples ---\n{}", lines.join("\n"))
+}
+
+/// Format the `--- temporal assertions ---` summary section for
+/// failure output. Walks BOTH the failure-detail and
+/// inconclusive-detail streams, filters to entries tagged
+/// [`crate::assert::DetailKind::Temporal`], and renders each as a
+/// single line. The section is suppressed when no temporal-tagged
+/// detail is present so non-temporal failure paths do not pick up
+/// an empty section header.
+///
+/// Why both streams: temporal patterns can push BOTH `Outcome::Fail`
+/// (via `crate::assert::temporal::push_detail`) and
+/// `Outcome::Inconclusive` (via
+/// `crate::assert::temporal::push_inconclusive` — e.g. zero-
+/// denominator rate_within / ratio_within); rendering only Fails
+/// would silently drop the Inconclusive diagnostic when the verdict
+/// arm is Inconclusive (no Fail recorded), losing the operator-
+/// visible message that explains WHY the gate could not evaluate.
+/// The caller at [`crate::test_support::eval`]'s failure dumper
+/// runs on both arms.
+pub(crate) fn format_temporal_assertions_section(result: &crate::assert::AssertResult) -> String {
+    let temporal: Vec<&crate::assert::AssertDetail> = result
+        .failure_details()
+        .chain(result.inconclusive_details())
+        .filter(|d| d.kind == crate::assert::DetailKind::Temporal)
+        .collect();
+    if temporal.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(temporal.len() + 1);
+    lines.push(format!(
+        "{n} temporal assertion entry(ies):",
+        n = temporal.len()
+    ));
+    for detail in temporal {
+        lines.push(format!("  {}", detail.message));
+    }
+    format!("\n\n--- temporal assertions ---\n{}", lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_helpers::{assert_result_tlv_entry, build_assert_result};
+    use super::*;
+    use crate::assert::{AssertDetail, DetailKind};
+    use crate::verifier::{SCHED_OUTPUT_END, SCHED_OUTPUT_START};
+    use crate::vmm::host_comms::BulkDrainResult;
+    use crate::vmm::wire::{MSG_TYPE_TEST_RESULT, ShmEntry};
+
+    fn drain_with_assert(r: &AssertResult) -> BulkDrainResult {
+        BulkDrainResult {
+            entries: vec![assert_result_tlv_entry(r)],
+        }
+    }
+
+    // -- parse_assert_result_from_drain --
+
+    /// A postcard-encoded `MSG_TYPE_TEST_RESULT` entry decodes back to
+    /// the same `AssertResult`. Pin the round-trip so a future
+    /// encoding tweak trips this test before reaching the real wire.
+    #[test]
+    fn parse_assert_result_from_drain_round_trips() {
+        let original = build_assert_result(true, vec![]);
+        let drain = drain_with_assert(&original);
+        let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
+        assert!(r.is_pass());
+    }
+
+    /// A failing `AssertResult` round-trips its details verbatim.
+    #[test]
+    fn parse_assert_result_from_drain_failed_preserves_details() {
+        let original = build_assert_result(
+            false,
+            vec![AssertDetail::new(DetailKind::Stuck, "stuck 3000ms")],
+        );
+        let drain = drain_with_assert(&original);
+        let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
+        assert!(r.is_fail());
+        assert_eq!(
+            r.failure_details()
+                .map(|d| d.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stuck 3000ms"]
+        );
+    }
+
+    /// `None` drain → "no guest messages" error. Mirrors the host
+    /// path where `result.guest_messages` is `None` because the bulk
+    /// port never produced a single byte.
+    #[test]
+    fn parse_assert_result_from_drain_none_returns_error() {
+        assert!(parse_assert_result_from_drain(None).is_err());
+    }
+
+    /// Empty `BulkDrainResult` → "no test result in guest messages"
+    /// error. Mirrors the host path where the bulk port produced
+    /// other entries (PROFRAW, STIMULUS, EXIT) but never a
+    /// MSG_TYPE_TEST_RESULT frame.
+    #[test]
+    fn parse_assert_result_from_drain_empty_returns_error() {
+        let drain = BulkDrainResult { entries: vec![] };
+        assert!(parse_assert_result_from_drain(Some(&drain)).is_err());
+    }
+
+    /// CRC-bad MSG_TYPE_TEST_RESULT entry is ignored; the helper
+    /// returns "no test result" rather than feeding a corrupt
+    /// payload into the postcard decoder.
+    #[test]
+    fn parse_assert_result_from_drain_skips_crc_bad_entries() {
+        let drain = BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_TEST_RESULT,
+                payload: vec![0xff; 4],
+                crc_ok: false,
+            }],
+        };
+        assert!(parse_assert_result_from_drain(Some(&drain)).is_err());
+    }
+
+    /// Multiple MSG_TYPE_TEST_RESULT entries — the helper picks the
+    /// last (latest-emitted) one. Pins "latest wins" semantics.
+    #[test]
+    fn parse_assert_result_from_drain_picks_latest() {
+        let early = build_assert_result(false, vec![AssertDetail::new(DetailKind::Other, "early")]);
+        let late = build_assert_result(true, vec![]);
+        let drain = BulkDrainResult {
+            entries: vec![
+                assert_result_tlv_entry(&early),
+                assert_result_tlv_entry(&late),
+            ],
+        };
+        let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
+        assert!(r.is_pass(), "latest entry must win");
+    }
+
+    /// Malformed postcard payload (right msg_type, right CRC, wrong
+    /// bytes) surfaces the postcard decode error rather than silently
+    /// returning a default `AssertResult`.
+    #[test]
+    fn parse_assert_result_from_drain_rejects_garbage_payload() {
+        let payload = vec![0xab; 8];
+        let drain = BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_TEST_RESULT,
+                payload,
+                crc_ok: true,
+            }],
+        };
+        assert!(parse_assert_result_from_drain(Some(&drain)).is_err());
+    }
+
+    // -- sched_log_fingerprint --
+
+    #[test]
+    fn sched_log_fingerprint_last_line() {
+        let output = format!(
+            "{SCHED_OUTPUT_START}\nstarting scheduler\nError: apply_cell_config BPF program returned error -2\n{SCHED_OUTPUT_END}",
+        );
+        assert_eq!(
+            sched_log_fingerprint(&output),
+            Some("Error: apply_cell_config BPF program returned error -2"),
+        );
+    }
+
+    #[test]
+    fn sched_log_fingerprint_skips_trailing_blanks() {
+        let output = format!("{SCHED_OUTPUT_START}\nfatal error here\n\n\n{SCHED_OUTPUT_END}",);
+        assert_eq!(sched_log_fingerprint(&output), Some("fatal error here"));
+    }
+
+    #[test]
+    fn sched_log_fingerprint_none_without_markers() {
+        assert!(sched_log_fingerprint("no markers").is_none());
+    }
+
+    #[test]
+    fn sched_log_fingerprint_none_empty_content() {
+        let output = format!("{SCHED_OUTPUT_START}\n\n{SCHED_OUTPUT_END}");
+        assert!(sched_log_fingerprint(&output).is_none());
+    }
+
+    // -- extract_sched_ext_dump --
+
+    #[test]
+    fn extract_sched_ext_dump_present() {
+        let output = "noise\n  ktstr-0  [001]  0.500: sched_ext_dump: Debug dump\n  ktstr-0  [001]  0.501: sched_ext_dump: scheduler state\nmore";
+        let parsed = extract_sched_ext_dump(output);
+        assert!(parsed.is_some());
+        let dump = parsed.unwrap();
+        assert!(dump.contains("sched_ext_dump: Debug dump"));
+        assert!(dump.contains("sched_ext_dump: scheduler state"));
+    }
+
+    #[test]
+    fn extract_sched_ext_dump_absent() {
+        assert!(extract_sched_ext_dump("no dump lines here").is_none());
+    }
+
+    #[test]
+    fn extract_sched_ext_dump_empty_output() {
+        assert!(extract_sched_ext_dump("").is_none());
+    }
+
+    #[test]
+    fn extract_sched_ext_dump_requires_colon_after_marker() {
+        // A printk that mentions the bare substring `sched_ext_dump`
+        // without the trailing colon is NOT a dump-tracepoint output
+        // line. The extractor must filter on the literal marker
+        // `sched_ext_dump:` (with colon) so unrelated kernel printks
+        // — e.g. `"BUG in sched_ext_dump_disable callback"` or a
+        // systemd unit reference like `"sched_ext_dump.service"` —
+        // do not get pulled into the dump section.
+        let output = "[  0.1] BUG in sched_ext_dump_disable callback\n\
+                      systemd[1]: Started sched_ext_dump.service.\n";
+        assert!(
+            extract_sched_ext_dump(output).is_none(),
+            "non-marker lines must not surface as dump lines"
+        );
+    }
+
+    /// E2E expectation: when scx-ktstr's ops.dump / dump_cpu /
+    /// dump_task callbacks fire under a real stall, every line they
+    /// emit via `scx_bpf_dump` reaches userspace through the kernel
+    /// `sched_ext_dump` tracepoint (kernel/sched/ext.c:dump_line)
+    /// and lands in the captured trace_pipe stream as
+    /// `<task>  [<cpu>]  <ts>: sched_ext_dump: <ops.dump-line>`.
+    ///
+    /// `scx-ktstr/src/bpf/main.bpf.c` declares three ops callbacks:
+    ///   - `ktstr_dump`: emits `ktstr scheduler state:` and three
+    ///     follow-up lines naming `stall`, `crash`, `degrade_rt`,
+    ///     etc.;
+    ///   - `ktstr_dump_cpu`: emits `ktstr cpu N: no per-cpu state`
+    ///     for every NON-idle CPU (idle CPUs are skipped so the
+    ///     kernel's `if (idle && used == seq_buf_used(&ns))` gate
+    ///     suppresses the per-CPU section, see
+    ///     kernel/sched/ext.c:6127-6283);
+    ///   - `ktstr_dump_task`: emits `ktstr task: magic=0x... counter=N`
+    ///     for every runnable task whose `scx_task_data(p)` is
+    ///     non-null.
+    ///
+    /// This test pins those three string shapes against the
+    /// trace_pipe parser. A regression that renames a marker, drops
+    /// the `\n`, or changes the prefix scheme breaks the host-side
+    /// failure-dump rendering — the parser would silently fall
+    /// through to "no dump lines" and the operator would lose every
+    /// scheduler-author hint that ops.dump exists to surface. The
+    /// fixture is the same wire format the kernel produces; the
+    /// test asserts the parser can slice it cleanly without losing
+    /// any of the three layers.
+    #[test]
+    fn extract_sched_ext_dump_recovers_ktstr_ops_dump_layers() {
+        // Synthetic trace_pipe stream emitted by the kernel's
+        // `dump_line` -> `trace_sched_ext_dump(line_buf)` path when
+        // scx-ktstr's ops.dump callbacks fire. Real lines carry
+        // a leading task/CPU/timestamp prefix and the
+        // `sched_ext_dump:` tag injected by the tracepoint.
+        let trace_pipe = "\
+   scx_-1234  [002]   100.000000: sched_ext_dump: Debug dump triggered by error\n\
+   scx_-1234  [002]   100.000001: sched_ext_dump: ktstr scheduler state:\n\
+   scx_-1234  [002]   100.000002: sched_ext_dump:   stall=1 crash=0 degrade_rt=0\n\
+   scx_-1234  [002]   100.000003: sched_ext_dump:   rodata: degrade=0 slow=0 scattershot=0 verify_loop=0 fail_verify=0\n\
+   scx_-1234  [002]   100.000004: sched_ext_dump:   ktstr_alloc_count=42 degrade_cnt=0 slow_cnt=0\n\
+   scx_-1234  [002]   100.000005: sched_ext_dump: CPU states\n\
+   scx_-1234  [002]   100.000006: sched_ext_dump: ----------\n\
+   scx_-1234  [002]   100.000007: sched_ext_dump: ktstr cpu 1: no per-cpu state\n\
+   scx_-1234  [002]   100.000008: sched_ext_dump: ktstr cpu 3: no per-cpu state\n\
+   scx_-1234  [002]   100.000009: sched_ext_dump:   ktstr task: magic=0xdeadbeefcafebabe counter=42\n\
+   unrelated noise that must NOT match\n";
+
+        let parsed = extract_sched_ext_dump(trace_pipe)
+            .expect("parser must surface every sched_ext_dump line");
+
+        // ops.dump layer.
+        assert!(
+            parsed.contains("ktstr scheduler state:"),
+            "ops.dump header missing; parser dropped the `ktstr scheduler state:` \
+             line emitted by scx-ktstr's ktstr_dump callback. parsed: {parsed}"
+        );
+        assert!(
+            parsed.contains("stall=1 crash=0 degrade_rt=0"),
+            "ops.dump body missing; parser dropped the runtime-flag line. \
+             parsed: {parsed}"
+        );
+        assert!(
+            parsed.contains("ktstr_alloc_count=42"),
+            "ops.dump body missing; parser dropped the alloc-count line. \
+             parsed: {parsed}"
+        );
+
+        // ops.dump_cpu layer (NON-idle CPUs only — idle CPUs emit
+        // nothing per the kernel's idle-suppression gate).
+        assert!(
+            parsed.contains("ktstr cpu 1: no per-cpu state"),
+            "ops.dump_cpu output missing; parser dropped the CPU 1 \
+             marker emitted by ktstr_dump_cpu for non-idle CPUs. \
+             parsed: {parsed}"
+        );
+        assert!(
+            parsed.contains("ktstr cpu 3: no per-cpu state"),
+            "ops.dump_cpu output missing; parser dropped the CPU 3 \
+             marker. parsed: {parsed}"
+        );
+
+        // ops.dump_task layer — magic reads as the LE u64 of
+        // KTSTR_ARENA_MAGIC verbatim (the BPF format string uses
+        // %llx so it appears in the dump as a hex literal).
+        assert!(
+            parsed.contains("ktstr task: magic=0xdeadbeefcafebabe counter=42"),
+            "ops.dump_task output missing; parser dropped the per-task \
+             magic/counter line emitted by ktstr_dump_task. parsed: \
+             {parsed}"
+        );
+
+        // Negative: the non-prefixed noise line MUST NOT slip into
+        // the dump string — extract_sched_ext_dump filters by the
+        // `sched_ext_dump` substring, so unrelated trace_pipe lines
+        // are dropped.
+        assert!(
+            !parsed.contains("unrelated noise"),
+            "parser leaked a non-sched_ext_dump line: {parsed}"
+        );
+    }
+
+    // -- extract_bug_summary --
+
+    /// Canonical kernel dump format: `triggered exit kind` anchor
+    /// plus next line's reason via `sched_ext_dump:` prefix.
+    /// Extract the reason body.
+    #[test]
+    fn extract_bug_summary_from_canonical_kernel_dump() {
+        let dump = "  ktstr-1234   [001]   0.500: sched_ext_dump: scheduler[5678] triggered exit kind 5:\n  \
+                      ktstr-1234   [001]   0.501: sched_ext_dump:   apply_cell_config returned -EINVAL (apply_cell_config)\n";
+        let summary = extract_bug_summary("", dump).expect("dump with anchor must yield summary");
+        assert!(
+            summary.contains("apply_cell_config returned -EINVAL"),
+            "summary must carry the BPF error text: {summary}",
+        );
+        assert!(
+            !summary.contains("sched_ext_dump:"),
+            "trace_pipe prefix must be stripped from the returned body: {summary}",
+        );
+    }
+
+    /// Multi-event dump: first event wins. A regression that
+    /// returned the LAST event or concatenated multiple would
+    /// surface here.
+    #[test]
+    fn extract_bug_summary_first_event_wins() {
+        let dump = "  ktstr-1   [001]   0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:\n  \
+                      ktstr-1   [001]   0.501: sched_ext_dump:   first_error returned -EINVAL\n  \
+                      ktstr-1   [001]   1.000: sched_ext_dump: scheduler[2] triggered exit kind 5:\n  \
+                      ktstr-1   [001]   1.001: sched_ext_dump:   second_error returned -EBUSY\n";
+        let summary = extract_bug_summary("", dump).expect("multi-event dump must yield summary");
+        assert!(
+            summary.contains("first_error"),
+            "first event must win: {summary}",
+        );
+        assert!(
+            !summary.contains("second_error"),
+            "second event must NOT appear in the BUG SUMMARY: {summary}",
+        );
+    }
+
+    /// No anchor in dump, fallback to sched_log `scx_bpf_error`.
+    /// Pin the fallback path so a future regression that drops it
+    /// (e.g. inverts the conditional logic) trips here.
+    #[test]
+    fn extract_bug_summary_fallback_to_sched_log_scx_bpf_error() {
+        let sched_log = "starting up\n\
+                         scx_bpf_error: apply_cell_config: cell_id=3 returned -EINVAL\n\
+                         exiting\n";
+        let summary = extract_bug_summary(sched_log, "")
+            .expect("sched_log with scx_bpf_error must yield summary");
+        assert!(
+            summary.contains("scx_bpf_error"),
+            "fallback must surface the scx_bpf_error line: {summary}",
+        );
+        assert!(
+            summary.contains("apply_cell_config"),
+            "fallback must surface the full error line: {summary}",
+        );
+    }
+
+    /// No bug anywhere: returns None. A regression that emitted
+    /// an empty BUG SUMMARY: line for every passing test would
+    /// surface as a noise floor; pin None here.
+    #[test]
+    fn extract_bug_summary_none_when_no_error_present() {
+        assert!(extract_bug_summary("clean scheduler log\n", "boot complete\n").is_none());
+        assert!(extract_bug_summary("", "").is_none());
+    }
+
+    /// ANSI-colored input gets stripped before scan. A colored
+    /// log from a scheduler binary that wraps its error in
+    /// `\x1b[31m...\x1b[0m` (red text) must still surface the
+    /// underlying text — and the returned summary must NOT carry
+    /// the ANSI escapes.
+    #[test]
+    fn extract_bug_summary_strips_ansi_csi() {
+        let sched_log = "\x1b[31mscx_bpf_error\x1b[0m: red-wrapped error text\n";
+        let summary = extract_bug_summary(sched_log, "")
+            .expect("ANSI-wrapped error line must still match scx_bpf_error");
+        assert!(
+            !summary.contains('\x1b'),
+            "ANSI escapes must be stripped from the returned summary: {summary:?}",
+        );
+        assert!(
+            summary.contains("scx_bpf_error"),
+            "the underlying text must still be found: {summary}",
+        );
+    }
+
+    /// ANSI-colored DUMP input gets stripped before the dump-path
+    /// anchor scan. Symmetric with `extract_bug_summary_strips_ansi_csi`
+    /// which only covered the sched_log fallback path. A regression
+    /// in dump-side ANSI handling (e.g. forgetting to call
+    /// strip_ansi_csi on the dump argument) would surface here but
+    /// not in the sched_log test.
+    #[test]
+    fn extract_bug_summary_strips_ansi_from_dump_anchor() {
+        let dump = "  ktstr-1234   [001]   0.500: sched_ext_dump: \x1b[1mscheduler[5678] triggered exit kind 5:\x1b[0m\n  \
+                      ktstr-1234   [001]   0.501: sched_ext_dump:   \x1b[31mapply_cell_config returned -EINVAL\x1b[0m (apply_cell_config)\n";
+        let summary =
+            extract_bug_summary("", dump).expect("ANSI-wrapped dump anchor must still match");
+        assert!(
+            !summary.contains('\x1b'),
+            "ANSI escapes must be stripped from the dump-path returned summary: {summary:?}",
+        );
+        assert!(
+            summary.contains("apply_cell_config returned -EINVAL"),
+            "the underlying body text must still be extracted: {summary}",
+        );
+    }
+
+    /// Real-shaped kernel scheduler crash trace fixture: a
+    /// multi-CPU trace_pipe dump representing the production
+    /// pattern when a scx scheduler triggers `scx_bpf_error` and
+    /// the kernel emits the `triggered exit kind 5` event followed
+    /// by a same-CPU body line. The fixture mirrors what an
+    /// operator captures from `cat /sys/kernel/tracing/trace_pipe`
+    /// during a real scheduler crash: pre-crash scheduler events
+    /// from multiple CPUs, the anchor + body pair, cross-CPU
+    /// interleaved events between them (per kernel/sched/ext.c the
+    /// dump_line() calls are under scx_dump_lock but trace_pipe
+    /// merges per-CPU ring buffers so unrelated tracepoint events
+    /// from other CPUs land between the pair), post-crash cleanup
+    /// records. Pins the end-to-end extraction against a fixture
+    /// that more closely resembles production input than the
+    /// hand-crafted 2-line `extract_bug_summary_*` siblings above
+    /// — guarding against a regression that handles the synthetic
+    /// shapes but breaks on real-shaped multi-CPU interleaved
+    /// input (the `find_same_cpu_body_after` filter
+    /// is the load-bearing logic; this test exercises it through
+    /// the public entry point with input shaped like real
+    /// trace_pipe output rather than calling the helper directly).
+    #[test]
+    fn extract_bug_summary_real_shaped_scheduler_crash_trace() {
+        // Fixture mirrors the kernel's actual dump_line() emission
+        // contract at kernel/sched/ext.c:6161-6163:
+        //   "%s[%d] triggered exit kind %d:"  with current->comm,
+        //                                          current->pid,
+        //                                          ei->kind
+        //   "  %s (%s)"                       with ei->reason,
+        //                                          ei->msg
+        // Exit-kind 1025 = SCX_EXIT_ERROR_BPF (the scx_bpf_error
+        // class, per kernel/sched/ext_internal.h:39-52). Reason
+        // string "scx_bpf_error" matches ei->reason for this kind
+        // (kernel/sched/ext.c:5434-5455). The body uses paren-wrap
+        // formatting `<reason> (<msg>)` per the kernel format
+        // string, not colon-separated.
+        let dump = "\
+   scx_layered-3417  [001]   125.812043: sched_ext_dump: scx_layered[3417] triggered exit kind 1025:\n\
+        ksoftirqd/2-21    [002]   125.812055: sched_switch: prev_comm=ksoftirqd/2 prev_pid=21\n\
+        kworker/3:1-67    [003]   125.812061: sched_switch: prev_comm=kworker/3:1 prev_pid=67\n\
+   scx_layered-3417  [001]   125.812078: sched_ext_dump:   scx_bpf_error (layer_cpumask_intersect: layer=2 cpu=15 out of range (online_cpus=12))\n\
+   scx_layered-3417  [001]   125.812091: sched_ext_dump:\n\
+   scx_layered-3417  [001]   125.812094: sched_ext_dump: Backtrace:\n\
+   scx_layered-3417  [001]   125.812097: sched_ext_dump:   layer_cpumask_intersect+0x5c/0x180 [scx_layered]\n\
+   scx_layered-3417  [001]   125.812099: sched_ext_dump:   pick_idle_cpu+0x1a4/0x420 [scx_layered]\n\
+   scx_layered-3417  [001]   125.812102: sched_ext_dump:   bpf_scx_ops_select_cpu+0x90/0xc0\n\
+        kworker/0:2-89    [000]   125.812110: sched_wakeup: comm=migration/0 pid=14 prio=120\n\
+   scx_layered-3417  [001]   125.812115: sched_ext_dump: Stats:\n\
+   scx_layered-3417  [001]   125.812118: sched_ext_dump:   tasks_throttled=0 tasks_unthrottled=0\n\
+        systemd-1         [000]   125.815201: sched_process_exit: comm=scx_layered pid=3417 prio=120\n\
+";
+        let summary =
+            extract_bug_summary("", dump).expect("real-shaped multi-CPU dump must yield a summary");
+        // Exact-equality pin: extracts EXACTLY the first same-CPU
+        // body line after the anchor, with the trace_pipe envelope
+        // (`<task>-<pid> [<cpu>] <ts>: sched_ext_dump:`) stripped
+        // and the body trimmed. Pinning the whole string in one
+        // assertion subsumes every contains/!contains check the
+        // operator would otherwise sprinkle (body text present,
+        // trace_pipe prefix absent, cross-CPU events absent,
+        // Backtrace/Stats sub-sections absent, single-line). Any
+        // regression that alters one byte of the returned summary
+        // surfaces here.
+        //
+        // Regression classes this pin catches:
+        // - greedy collect of same-CPU lines past the body
+        //   (Backtrace + Stats sub-sections at [001] would
+        //   concatenate in)
+        // - filter inversion that includes cross-CPU
+        //   sched_switch / sched_wakeup events
+        // - prefix-strip drop that leaves `sched_ext_dump:` or
+        //   `[001]` in the body
+        // - anchor-line return (returning the anchor's own body
+        //   text instead of the next same-CPU line)
+        // - body trim removal (leading/trailing whitespace
+        //   smuggling)
+        assert_eq!(
+            summary,
+            "scx_bpf_error (layer_cpumask_intersect: layer=2 cpu=15 out of range (online_cpus=12))",
+            "summary must be EXACTLY the first same-CPU body line after the anchor, \
+             with the trace_pipe `<task>-<pid> [<cpu>] <ts>: sched_ext_dump:` prefix \
+             stripped and the body trimmed; got: {summary:?}",
+        );
+    }
+
+    /// Whitespace-only extracted body: returns None (suppress
+    /// noise). A regression that returned `Some("")` would inject
+    /// empty `BUG SUMMARY:` lines into stderr — pin None here.
+    #[test]
+    fn extract_bug_summary_none_when_body_is_whitespace() {
+        let dump = "  ktstr-1   [001]   0.5: sched_ext_dump: foo triggered exit kind 5:\n  \
+                      ktstr-1   [001]   0.5: sched_ext_dump:   \n";
+        assert!(extract_bug_summary("", dump).is_none());
+    }
+
+    /// Closer-only dump (BPF scheduler disabled but no
+    /// `triggered exit kind` anchor) returns None. Pin so a
+    /// future scan that picked disable closers as the summary
+    /// would surface here.
+    #[test]
+    fn extract_bug_summary_none_on_closer_only_dump() {
+        let dump = "  ktstr-1   [001]   0.5: sched_ext_dump: sched_ext: BPF scheduler \"scx_mitosis\" disabled (Error)\n";
+        assert!(extract_bug_summary("", dump).is_none());
+    }
+
+    /// Anchor on the dump's LAST line (no following body line):
+    /// `lines.get(i + 1)` returns `None`, the anchor loop falls
+    /// through, and the function moves on to the sched_log
+    /// fallback. Pin both arms: with an empty sched_log the
+    /// overall result is `None` (no body, no fallback), and with
+    /// a sched_log carrying an `scx_bpf_error` line the fallback
+    /// surfaces it. A future refactor that swapped `find` for
+    /// e.g. "scan all anchors and take the best body" could
+    /// silently change the no-following-line semantics — the
+    /// no-fallback assertion catches the case where the new
+    /// scan invents a body out of thin air, and the fallback
+    /// assertion catches the case where the new scan
+    /// short-circuits past the sched_log path.
+    #[test]
+    fn extract_bug_summary_anchor_on_last_line_falls_through() {
+        let dump = "  ktstr-1 [001] 0.5: sched_ext_dump: scheduler[1] triggered exit kind 5:\n";
+        assert!(
+            extract_bug_summary("", dump).is_none(),
+            "anchor on last line with empty sched_log must yield None",
+        );
+        let summary = extract_bug_summary("scx_bpf_error: late fallback\n", dump)
+            .expect("anchor on last line must fall through to sched_log fallback");
+        assert_eq!(
+            summary, "scx_bpf_error: late fallback",
+            "fallback must return the trimmed scx_bpf_error line verbatim; a \
+             regression that surfaced the whole sched_log buffer, an empty \
+             string, or a sentinel placeholder would trip here but slip past \
+             a `contains` check: {summary}",
+        );
+    }
+
+    /// Anchor in the dump takes precedence over an `scx_bpf_error`
+    /// line in the sched_log fallback. The function's early return
+    /// at the end of the dump-scan loop (`extract_bug_summary`'s
+    /// `return Some(body.to_string())` inside its dump-scan loop) must
+    /// fire before the fallback loop ever starts. A regression that
+    /// reordered the two scans, or that concatenated their outputs,
+    /// would silently change which signal source wins on tests that
+    /// expose both. None of the prior `extract_bug_summary_*` tests
+    /// in the sibling cluster above populate the dump AND sched_log
+    /// such that each path would independently produce a `Some`
+    /// result — the canonical-dump test has no sched_log, the
+    /// fallback test has no dump anchor, the first-event-wins test
+    /// has no sched_log, and the last-line-fall-through test's
+    /// dump-arm has no following body so its dump-scan never
+    /// independently produces `Some`. This case closes that gap.
+    #[test]
+    fn extract_bug_summary_anchor_takes_precedence_over_sched_log_fallback() {
+        let dump = "  ktstr-1 [001] 0.5: sched_ext_dump: scheduler[1] triggered exit kind 5:\n  \
+                      ktstr-1 [001] 0.5: sched_ext_dump:   anchor body wins\n";
+        let sched_log = "scx_bpf_error: fallback should NOT fire when dump has anchor\n";
+        let summary = extract_bug_summary(sched_log, dump)
+            .expect("anchor + sched_log → Some via anchor scan");
+        assert_eq!(
+            summary, "anchor body wins",
+            "dump-scan anchor must early-return before the sched_log \
+             fallback loop runs; a regression that ran fallback first, or \
+             concatenated the two, would surface the scx_bpf_error line \
+             instead: {summary}",
+        );
+    }
+
+    /// Cross-CPU interleaving: a tracepoint event fired from a
+    /// DIFFERENT CPU lands between the kernel's anchor and body
+    /// `dump_line` calls in the trace_pipe stream (because
+    /// trace_pipe merges per-CPU ring buffers without preserving
+    /// the emit-order of distinct CPUs). The dump scan walks
+    /// forward from the anchor for the first SAME-CPU line that
+    /// isn't itself another anchor, skipping the interleaved
+    /// cross-CPU event. A regression that reverted to strict
+    /// `lines.get(i + 1)` adjacency would surface the wrong
+    /// scheduler's `unrelated event` here.
+    #[test]
+    fn extract_bug_summary_skips_interleaved_other_cpu_event() {
+        let dump = "\
+ktstr-1234 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
+ktstr-1234 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let summary = extract_bug_summary("", dump)
+            .expect("interleaved cross-CPU event must not block body extraction");
+        assert!(
+            summary.contains("apply_cell_config returned -EINVAL"),
+            "must return the same-CPU body, skipping the [002] interleaved event: {summary}",
+        );
+        assert!(
+            !summary.contains("unrelated event"),
+            "must NOT surface the cross-CPU interleaved line as the body: {summary}",
+        );
+    }
+
+    /// No same-CPU body anywhere after the anchor — the dump
+    /// scan finds no candidate body and falls through to the
+    /// sched_log fallback. A regression that relaxed the
+    /// same-CPU restriction back to strict adjacency would
+    /// surface the foreign-CPU `[002]` line as the body here.
+    #[test]
+    fn extract_bug_summary_falls_through_when_no_same_cpu_body() {
+        let dump = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-2 [002] 0.500: sched_ext_dump: scheduler[2] unrelated from cpu 2
+ktstr-3 [003] 0.501: sched_ext_dump: scheduler[3] unrelated from cpu 3
+";
+        assert!(
+            extract_bug_summary("", dump).is_none(),
+            "no same-CPU body and empty sched_log must yield None — \
+             a regression that relaxed the same-CPU restriction back \
+             to strict adjacency would surface the [002] line instead",
+        );
+        let summary = extract_bug_summary("scx_bpf_error: late fallback\n", dump)
+            .expect("with sched_log fallback, the scx_bpf_error line must surface");
+        assert!(
+            summary.contains("scx_bpf_error"),
+            "fallback path: {summary}",
+        );
+    }
+
+    /// A second `triggered exit kind` anchor on the SAME CPU
+    /// appears before the first anchor's body — the first
+    /// anchor's body was lost (truncation, dump_line failure).
+    /// The same-CPU scan must stop at the second anchor rather
+    /// than mis-adopting its data as the first anchor's body.
+    /// The outer loop then advances to the second anchor and
+    /// extracts ITS body normally.
+    #[test]
+    fn extract_bug_summary_stops_at_next_anchor_on_same_cpu() {
+        let dump = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-1 [001] 0.510: sched_ext_dump: scheduler[2] triggered exit kind 7:
+ktstr-1 [001] 0.511: sched_ext_dump:   second_error returned -EBUSY
+";
+        let summary = extract_bug_summary("", dump)
+            .expect("outer loop must reach the second anchor and extract its body");
+        assert_eq!(
+            summary, "second_error returned -EBUSY",
+            "first anchor must NOT adopt the second anchor's body; the \
+             outer loop advances to the second anchor: {summary}",
+        );
+    }
+
+    /// Anchor with NO `[<cpu>]` prefix (synthetic test input
+    /// without trace_pipe framing) falls back to strict
+    /// adjacency — `anchor_cpu` is `None`, so the same-CPU
+    /// filter is bypassed and the first non-anchor subsequent
+    /// line is taken as the body. Preserves backward
+    /// compatibility for inputs that don't carry the trace_pipe
+    /// envelope.
+    #[test]
+    fn extract_bug_summary_no_cpu_prefix_falls_back_to_adjacency() {
+        let dump = "scheduler[1] triggered exit kind 5:\n  body_without_trace_framing\n";
+        let summary = extract_bug_summary("", dump)
+            .expect("no-cpu-prefix anchor must still find an adjacent body");
+        assert_eq!(
+            summary, "body_without_trace_framing",
+            "without trace_pipe framing, the first subsequent line wins: {summary}",
+        );
+    }
+
+    /// Defensive pin against bracket-shadowing in the trace_pipe
+    /// task-name slot. `parse_trace_cpu` uses `rfind('[')` so a
+    /// pathological line whose task name (or any other prefix
+    /// token) contains `[<digits>]` can't shadow the real CPU
+    /// bracket. Without rfind, `find('[')` would land on the
+    /// task-name bracket, parse its inner as the CPU, and the
+    /// same-CPU filter would reject every subsequent line on the
+    /// real CPU.
+    #[test]
+    fn extract_bug_summary_cpu_parse_uses_last_bracket() {
+        // Anchor and body carry DIFFERENT leading bracketed tokens
+        // (`[5]` vs `[7]`) but share CPU bracket `[001]`. With a
+        // `find('[')` regression, anchor_cpu would lock onto `[5]`,
+        // body's prefix would parse to `[7]`, the same-CPU filter
+        // would reject the body, and extract_bug_summary would
+        // return None. The rfind impl correctly locks both onto
+        // `[001]` so the body is matched. Same digit-leading-
+        // bracket trick for both lines is what isolates the
+        // find/rfind divergence.
+        let dump = "\
+[5]-1234 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
+[7]-1234 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let summary = extract_bug_summary("", dump).expect(
+            "rfind on the prefix must pick the CPU bracket [001], not the leading \
+             task-name token ([5] or [7]) — otherwise anchor and body lock onto \
+             different fake CPUs and the body is rejected by the same-CPU filter",
+        );
+        assert_eq!(
+            summary, "apply_cell_config returned -EINVAL",
+            "must lock onto CPU [001] for both anchor and body, skipping the [002] \
+             interleaved event, despite the divergent leading bracket tokens [5]/[7]: \
+             {summary}",
+        );
+    }
+
+    // -- extract_exit_from_dump_trace --
+
+    /// Canonical kernel emission: `triggered exit kind` anchor
+    /// plus next dump line carrying the reason on the same CPU.
+    /// Pin the basic same-CPU extraction path.
+    #[test]
+    fn extract_exit_from_dump_trace_canonical() {
+        let console = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-1 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let reason =
+            extract_exit_from_dump_trace(console).expect("anchor + same-cpu body must yield Some");
+        assert_eq!(
+            reason, "apply_cell_config returned -EINVAL",
+            "must surface the body after `sched_ext_dump:`, trimmed: {reason}",
+        );
+    }
+
+    /// Cross-CPU interleaving: tracepoint event from a DIFFERENT
+    /// CPU lands between anchor and body in the trace_pipe stream.
+    /// The same-CPU scan in [`find_same_cpu_body_after`] skips the
+    /// interleaved event and surfaces the correct body. A
+    /// regression that reverted to strict adjacency would surface
+    /// the [002] event as the exit reason — exactly the failure
+    /// mode the sibling [`extract_bug_summary`] fix addresses.
+    #[test]
+    fn extract_exit_from_dump_trace_skips_interleaved_other_cpu_event() {
+        let console = "\
+ktstr-1234 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
+ktstr-1234 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let reason = extract_exit_from_dump_trace(console)
+            .expect("interleaved cross-CPU event must not block extraction");
+        assert_eq!(
+            reason, "apply_cell_config returned -EINVAL",
+            "must return the same-CPU body, skipping the [002] interleaved event: {reason}",
+        );
+    }
+
+    /// No anchor present: returns None. Pin so a regression
+    /// scanning for arbitrary `sched_ext_dump:` lines would
+    /// surface here.
+    #[test]
+    fn extract_exit_from_dump_trace_none_without_anchor() {
+        let console = "\
+ktstr-1 [001] 0.500: sched_ext_dump: routine status line
+ktstr-1 [001] 0.501: sched_ext_dump: another routine line
+";
+        assert!(extract_exit_from_dump_trace(console).is_none());
+    }
+
+    /// Next-same-CPU line is another anchor: don't adopt its data
+    /// as the first anchor's body. Outer loop advances to the
+    /// second anchor and extracts ITS body normally.
+    #[test]
+    fn extract_exit_from_dump_trace_stops_at_next_anchor_on_same_cpu() {
+        let console = "\
+ktstr-1 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-1 [001] 0.510: sched_ext_dump: scheduler[2] triggered exit kind 7:
+ktstr-1 [001] 0.511: sched_ext_dump:   second_error returned -EBUSY
+";
+        let reason = extract_exit_from_dump_trace(console)
+            .expect("outer loop must reach the second anchor and extract its body");
+        assert_eq!(
+            reason, "second_error returned -EBUSY",
+            "first anchor must NOT adopt the second anchor's body: {reason}",
+        );
+    }
+
+    /// Mirror of `extract_bug_summary_cpu_parse_uses_last_bracket`
+    /// for the sibling [`extract_exit_from_dump_trace`] code path.
+    /// Anchor and body carry different leading bracketed digit
+    /// tokens (`[5]` / `[7]`) but share CPU `[001]`. With a
+    /// `find('[')` regression, anchor_cpu = `[5]`, body's prefix
+    /// parses to `[7]`, same-CPU filter rejects, function returns
+    /// None. With rfind, both lock onto `[001]` and the body is
+    /// extracted.
+    #[test]
+    fn extract_exit_from_dump_trace_cpu_parse_uses_last_bracket() {
+        let console = "\
+[5]-1234 [001] 0.500: sched_ext_dump: scheduler[1] triggered exit kind 5:
+ktstr-5678 [002] 0.500: sched_ext_dump: scheduler[2] unrelated event from cpu 2
+[7]-1234 [001] 0.501: sched_ext_dump:   apply_cell_config returned -EINVAL
+";
+        let reason = extract_exit_from_dump_trace(console)
+            .expect("rfind on the prefix must pick CPU [001], not the leading task-name token");
+        assert_eq!(
+            reason, "apply_cell_config returned -EINVAL",
+            "must lock onto CPU [001] for both anchor and body despite the divergent \
+             leading bracket tokens [5]/[7]: {reason}",
+        );
+    }
+
+    // -- extract_kernel_version --
+
+    #[test]
+    fn extract_kernel_version_from_boot() {
+        let console = "[    0.000000] Linux version 6.14.0-rc3+ (user@host) (gcc) #1 SMP\n\
+                        [    0.001000] Command line: console=ttyS0";
+        assert_eq!(
+            extract_kernel_version(console),
+            Some("6.14.0-rc3+".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_kernel_version_none() {
+        assert_eq!(extract_kernel_version("no kernel here"), None);
+    }
+
+    #[test]
+    fn extract_kernel_version_bare() {
+        let console = "Linux version 6.12.0";
+        assert_eq!(extract_kernel_version(console), Some("6.12.0".to_string()),);
+    }
+
+    // -- format_console_diagnostics --
+
+    #[test]
+    fn format_console_diagnostics_empty_ok() {
+        assert_eq!(format_console_diagnostics("", 0, "test stage"), "");
+    }
+
+    #[test]
+    fn format_console_diagnostics_empty_nonzero_exit() {
+        let s = format_console_diagnostics("", 1, "test stage");
+        assert!(s.contains("exit_code=1"));
+        assert!(s.contains("--- diagnostics ---"));
+        assert!(s.contains("stage: test stage"));
+        assert!(!s.contains("console ("));
+    }
+
+    #[test]
+    fn format_console_diagnostics_with_console() {
+        let console = "line1\nline2\nKernel panic - not syncing\n";
+        let s = format_console_diagnostics(console, -1, "payload started");
+        assert!(s.contains("exit_code=-1"));
+        assert!(s.contains("console (3 lines)"));
+        assert!(s.contains("Kernel panic"));
+        assert!(s.contains("stage: payload started"));
+        assert!(!s.contains("window-truncated"));
+        assert!(!s.contains("last line incomplete"));
+        assert!(!s.contains("[partial]"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_truncates_long() {
+        // Window truncation: 50 lines reduces to TAIL_LINES (20)
+        // tail. The header announces `window-truncated`; the body
+        // does NOT carry the per-line `[partial]` marker because
+        // the input ends with `\n` (last line is complete).
+        let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
+        let console = format!("{}\n", lines.join("\n"));
+        let s = format_console_diagnostics(&console, 0, "test");
+        assert!(s.contains("console (20 lines, window-truncated)"));
+        assert!(s.contains("boot line 49"));
+        assert!(!s.contains("boot line 29"));
+        assert!(!s.contains("last line incomplete"));
+        assert!(!s.contains("[partial]"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_short_console() {
+        let console = "Linux version 6.14.0\nbooted ok\n";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains("console (2 lines)"));
+        assert!(s.contains("Linux version 6.14.0"));
+        assert!(s.contains("booted ok"));
+        assert!(!s.contains("window-truncated"));
+        assert!(!s.contains("last line incomplete"));
+        assert!(!s.contains("[partial]"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_no_truncation_with_trailing_newline() {
+        let console = "line1\nline2\nline3\n";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains("console (3 lines)"));
+        assert!(!s.contains("window-truncated"));
+        assert!(!s.contains("last line incomplete"));
+        assert!(!s.contains("[partial]"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_last_line_incomplete_without_window_drop() {
+        // Three short lines, last one missing trailing newline.
+        // The window does NOT drop anything (3 < TAIL_LINES); only
+        // the last line is partial.
+        let console = "line1\nline2\npartial li";
+        let s = format_console_diagnostics(console, 0, "test");
+        assert!(s.contains("console (3 lines, last line incomplete)"));
+        assert!(s.contains("partial li [partial]"));
+        assert!(!s.contains("window-truncated"));
+    }
+
+    #[test]
+    fn format_console_diagnostics_window_drop_and_last_line_incomplete() {
+        // Both conditions: 50 lines (window drops earlier ones)
+        // AND the input lacks a trailing newline (final line is
+        // partial). Header carries both labels in canonical order;
+        // body marks the partial last line.
+        let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
+        let console = lines.join("\n");
+        let s = format_console_diagnostics(&console, 0, "test");
+        assert!(s.contains("console (20 lines, window-truncated, last line incomplete)"));
+        assert!(s.contains("boot line 49 [partial]"));
+        assert!(!s.contains("boot line 29"));
+    }
+
+    // -- classify_init_stage --
+
+    fn lifecycle_only_drain(
+        phases: &[crate::vmm::wire::LifecyclePhase],
+    ) -> crate::vmm::host_comms::BulkDrainResult {
+        let entries = phases
+            .iter()
+            .map(|p| ShmEntry {
+                msg_type: crate::vmm::wire::MSG_TYPE_LIFECYCLE,
+                payload: vec![p.wire_value()],
+                crc_ok: true,
+            })
+            .collect();
+        crate::vmm::host_comms::BulkDrainResult { entries }
+    }
+
+    #[test]
+    fn classify_no_lifecycle_frames() {
+        // None drain — bulk port produced no entries. Maps to the
+        // "init did not even start" stage.
+        assert_eq!(classify_init_stage(None), STAGE_INIT_NOT_STARTED);
+        // Empty drain — same outcome.
+        let drain = crate::vmm::host_comms::BulkDrainResult { entries: vec![] };
+        assert_eq!(classify_init_stage(Some(&drain)), STAGE_INIT_NOT_STARTED);
+    }
+
+    #[test]
+    fn classify_init_started_only() {
+        let drain = lifecycle_only_drain(&[crate::vmm::wire::LifecyclePhase::InitStarted]);
+        assert_eq!(
+            classify_init_stage(Some(&drain)),
+            STAGE_INIT_STARTED_NO_PAYLOAD,
+        );
+    }
+
+    #[test]
+    fn classify_payload_starting() {
+        let drain = lifecycle_only_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::PayloadStarting,
+        ]);
+        assert_eq!(
+            classify_init_stage(Some(&drain)),
+            STAGE_PAYLOAD_STARTED_NO_RESULT,
+        );
+    }
+
+    #[test]
+    fn classify_payload_starting_without_init() {
+        // Edge case: PayloadStarting present but InitStarted
+        // missing. PayloadStarting implies init ran, so classify
+        // as payload started — same semantics the old string-walk
+        // pinned.
+        let drain = lifecycle_only_drain(&[crate::vmm::wire::LifecyclePhase::PayloadStarting]);
+        assert_eq!(
+            classify_init_stage(Some(&drain)),
+            STAGE_PAYLOAD_STARTED_NO_RESULT,
+        );
+    }
+
+    #[test]
+    fn classify_scheduler_died_without_payload_starting_is_init_no_payload() {
+        // SchedulerDied / SchedulerNotAttached without a preceding
+        // PayloadStarting frame mean init ran but the workload was
+        // never entered — the scheduler-setup phase failed before
+        // PayloadStarting could fire (rust_init/process.rs force_reboot
+        // paths at the SchedulerDied / SchedulerNotAttached arms
+        // never reach the workload-launch site). The stage is
+        // STAGE_INIT_STARTED_NO_PAYLOAD, not the deeper
+        // PAYLOAD_STARTED_NO_RESULT bucket — lumping these into
+        // the payload bucket misleads operators into thinking the
+        // workload ran and failed mid-test.
+        let died = lifecycle_only_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::SchedulerDied,
+        ]);
+        assert_eq!(
+            classify_init_stage(Some(&died)),
+            STAGE_INIT_STARTED_NO_PAYLOAD,
+        );
+        let not_attached = lifecycle_only_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+        ]);
+        assert_eq!(
+            classify_init_stage(Some(&not_attached)),
+            STAGE_INIT_STARTED_NO_PAYLOAD,
+        );
+    }
+
+    #[test]
+    fn classify_scheduler_died_after_payload_starting_is_payload_no_result() {
+        // SchedulerDied AFTER PayloadStarting means the workload
+        // DID enter — the scheduler died mid-test. This is the
+        // bug-exercised path, correctly classified as
+        // STAGE_PAYLOAD_STARTED_NO_RESULT. Pin so the new
+        // PayloadStarting-explicit gate doesn't accidentally
+        // demote this case.
+        let died_mid_test = lifecycle_only_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::PayloadStarting,
+            crate::vmm::wire::LifecyclePhase::SchedulerDied,
+        ]);
+        assert_eq!(
+            classify_init_stage(Some(&died_mid_test)),
+            STAGE_PAYLOAD_STARTED_NO_RESULT,
+        );
+    }
+
+    #[test]
+    fn classify_init_stage_skips_crc_bad_lifecycle_frames() {
+        // CRC-bad lifecycle frames are ignored. With only a
+        // CRC-bad InitStarted in the drain, the classifier sees no
+        // valid phase and returns NOT_STARTED.
+        let mut drain = lifecycle_only_drain(&[crate::vmm::wire::LifecyclePhase::InitStarted]);
+        drain.entries[0].crc_ok = false;
+        assert_eq!(classify_init_stage(Some(&drain)), STAGE_INIT_NOT_STARTED);
+    }
+
+    // -- extract_panic_message --
+
+    #[test]
+    fn extract_panic_message_found() {
+        let output = "noise\nPANIC: panicked at src/main.rs:5: oh no\nmore";
+        assert_eq!(
+            extract_panic_message(output),
+            Some("panicked at src/main.rs:5: oh no"),
+        );
+    }
+
+    #[test]
+    fn extract_panic_message_absent() {
+        assert!(extract_panic_message("no panic here").is_none());
+    }
+
+    #[test]
+    fn extract_panic_message_empty() {
+        assert!(extract_panic_message("").is_none());
+    }
+
+    /// Mid-line `PANIC:` occurrences must NOT match. The guest's
+    /// panic hook in `rust_init/init.rs` always emits the prefix at the
+    /// start of a line; a console log that incidentally contains
+    /// the literal `PANIC:` somewhere inside a longer info message
+    /// must not be misclassified as the panic. The previous
+    /// `.contains("PANIC:")` form would have surfaced this fixture
+    /// as a panic by stripping nothing and returning the trimmed
+    /// raw line.
+    #[test]
+    fn extract_panic_message_ignores_midline_occurrences() {
+        let output = "info: expected PANIC: somewhere in test\nmore noise";
+        assert!(
+            extract_panic_message(output).is_none(),
+            "mid-line `PANIC:` must not be matched as a panic prefix",
+        );
+    }
+
+    /// Whitespace-prefixed panic lines DO match — the guest panic
+    /// hook is anchored at column 0 in `rust_init/init.rs`, but COM2
+    /// transports can insert framing whitespace; the trim before
+    /// `strip_prefix` keeps matching robust against that.
+    #[test]
+    fn extract_panic_message_matches_whitespace_prefixed_line() {
+        let output = "noise\n   PANIC: indented panic\nmore";
+        assert_eq!(
+            extract_panic_message(output),
+            Some("indented panic"),
+            "leading whitespace before `PANIC:` must be trimmed before the prefix check",
+        );
+    }
+
+    // -- Verdict API integration coverage -------------------------------
+    //
+    // The host-side runner decodes the guest's postcard-encoded
+    // AssertResult via `parse_assert_result_from_drain`, then a
+    // scenario's verifier folds that result into a Verdict via
+    // `Verdict::merge`. This integration shape is the single most
+    // important assertion path for any test running inside a VM —
+    // pin it here so a regression that broke either the decode OR the
+    // merge surface trips at the seam.
+
+    /// Round-trip: failing AssertResult through postcard TLV →
+    /// `parse_assert_result_from_drain`, then merge into a Verdict
+    /// that records a pointwise claim from the host side. The
+    /// combined result must fail (the parsed AssertResult was
+    /// failing) AND carry both the guest-side detail AND the
+    /// host-side claim's failure detail — pinning that
+    /// `Verdict::merge` preserves details from both sides.
+    #[test]
+    fn parse_assert_result_threads_into_verdict_merge() {
+        use crate::assert::Verdict;
+
+        // Guest produced a failing AssertResult with one Stuck detail
+        // and a wake-latency measurement.
+        let original = build_assert_result(
+            false,
+            vec![AssertDetail::new(DetailKind::Stuck, "tid 42 stuck 3000ms")],
+        );
+        let drain = drain_with_assert(&original);
+        let parsed = parse_assert_result_from_drain(Some(&drain)).unwrap();
+        assert!(!parsed.is_pass(), "guest result must be failing");
+
+        // Host-side scenario adds its own claim — say, a deadline
+        // budget the host can verify post-VM (a pseudo-value here
+        // for the test).
+        let observed_runtime_us: u64 = 9000;
+        let mut v = Verdict::new();
+        crate::claim!(v, observed_runtime_us).at_most(5000);
+        v.merge(parsed);
+
+        let r = v.into_result();
+        assert!(
+            !r.is_pass(),
+            "merge of failing parsed result + failing host claim must fail",
+        );
+        // Both failures must be visible in the merged details: the
+        // host-side at_most claim AND the guest-side Stuck.
+        assert!(
+            r.failure_details()
+                .any(|d| d.message.contains("at most 5000")),
+            "host claim failure missing: {:?}",
+            r.outcomes,
+        );
+        assert!(
+            r.failure_details().any(|d| d.kind == DetailKind::Stuck),
+            "guest Stuck detail missing: {:?}",
+            r.outcomes,
+        );
+    }
+
+    /// Round-trip: a passing guest AssertResult merged into a
+    /// Verdict with passing host claims keeps the verdict passing.
+    /// Sibling of the failing-merge test — pins the happy path so
+    /// a regression that always-fails on merge (e.g. flipping the
+    /// passed-conjunction direction) trips here.
+    #[test]
+    fn parse_assert_result_passing_merge_keeps_verdict_passing() {
+        use crate::assert::Verdict;
+
+        let original = build_assert_result(true, vec![]);
+        let drain = drain_with_assert(&original);
+        let parsed = parse_assert_result_from_drain(Some(&drain)).unwrap();
+
+        let observed: u64 = 100;
+        let mut v = Verdict::new();
+        crate::claim!(v, observed).at_most(1000);
+        v.merge(parsed);
+
+        let r = v.into_result();
+        assert!(
+            r.is_pass(),
+            "passing merge must keep verdict passing: {:?}",
+            r.outcomes
+        );
+    }
+
+    // ---- format_periodic_samples_section ----
+
+    /// Periodic capture not configured: section is empty so a
+    /// non-periodic test's failure output stays uncluttered.
+    #[test]
+    fn format_periodic_samples_section_empty_when_target_zero() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 0;
+        result.periodic_fired = 0;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.is_empty());
+    }
+
+    /// Periodic capture configured and fully covered: section
+    /// renders with the coverage line.
+    #[test]
+    fn format_periodic_samples_section_full_coverage() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 5;
+        result.periodic_fired = 5;
+        result.periodic_real = 5;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.contains("--- periodic samples ---"));
+        assert!(s.contains("fired 5/5"));
+        assert!(s.contains("100% coverage"));
+        assert!(!s.contains("missing"));
+        assert!(!s.contains("placeholder"));
+    }
+
+    /// Periodic capture configured but partially covered: section
+    /// renders the coverage gap line.
+    #[test]
+    fn format_periodic_samples_section_partial_coverage() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 5;
+        result.periodic_fired = 2;
+        result.periodic_real = 2;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.contains("--- periodic samples ---"));
+        assert!(s.contains("fired 2/5"));
+        // Pin the percentage too: it is computed independently of the
+        // fired/target and missing slots, so an inverted or mis-scaled
+        // formula (e.g. 250% for 2/5) is invisible to those asserts. The
+        // sibling full_coverage test's 100% holds even under inversion.
+        assert!(s.contains("40% coverage"), "2/5 must render 40%: {s}");
+        assert!(s.contains("missing 3"));
+        assert!(!s.contains("placeholder"));
+    }
+
+    /// Every boundary fired but some landed only a degraded
+    /// placeholder: "100% fired" must not read as full coverage —
+    /// the section surfaces the real-capture floor so the operator
+    /// sees the placeholder gap.
+    #[test]
+    fn format_periodic_samples_section_distinguishes_placeholders() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 5;
+        result.periodic_fired = 5;
+        result.periodic_real = 2;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.contains("fired 5/5"));
+        // No coverage gap (every boundary fired) ...
+        assert!(!s.contains("missing"));
+        // ... but the placeholder fills are surfaced.
+        assert!(
+            s.contains("3 were degraded placeholders"),
+            "placeholder count must surface: {s}"
+        );
+        assert!(
+            s.contains("real BPF-state captures: 2/5"),
+            "real-capture floor must surface: {s}"
+        );
+    }
+
+    // ---- format_temporal_assertions_section ----
+
+    /// No temporal-tagged details: section is suppressed.
+    #[test]
+    fn format_temporal_assertions_section_empty_without_temporal_details() {
+        let mut r = crate::assert::AssertResult::pass();
+
+        r.record_fail(AssertDetail::new(DetailKind::Stuck, "tid 7 stuck 2000ms"));
+        let s = format_temporal_assertions_section(&r);
+        assert!(s.is_empty());
+    }
+
+    /// Temporal-tagged details flow into the section verbatim.
+    #[test]
+    fn format_temporal_assertions_section_renders_temporal_details() {
+        let mut r = crate::assert::AssertResult::pass();
+
+        r.record_fail(AssertDetail::new(
+            DetailKind::Temporal,
+            "counter (nondecreasing): regression at sample periodic_001",
+        ));
+        r.record_fail(AssertDetail::new(DetailKind::Stuck, "unrelated failure"));
+        r.record_fail(AssertDetail::new(
+            DetailKind::Temporal,
+            "load (steady_within ...): outlier at sample periodic_005",
+        ));
+        let s = format_temporal_assertions_section(&r);
+        assert!(s.contains("--- temporal assertions ---"));
+        assert!(s.contains("2 temporal assertion entry(ies)"));
+        assert!(s.contains("counter (nondecreasing)"));
+        assert!(s.contains("load (steady_within"));
+        // Non-temporal details must NOT bleed into the section.
+        assert!(!s.contains("unrelated failure"));
+    }
+
+    /// Temporal-tagged Inconclusive details (e.g. zero-denominator
+    /// rate_within / ratio_within from temporal.rs's
+    /// push_inconclusive) must flow into the section alongside Fail
+    /// details. The section is reached on both Fail AND Inconclusive
+    /// verdict arms by the failure dumper; rendering only Fails
+    /// would silently drop the Inconclusive diagnostic when the
+    /// verdict arm is Inconclusive, losing the operator-visible
+    /// message that explains WHY the gate could not evaluate.
+    #[test]
+    fn format_temporal_assertions_section_renders_inconclusive_temporal_details() {
+        let mut r = crate::assert::AssertResult::pass();
+
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Temporal,
+            "rate_within: zero-denominator at sample periodic_003",
+        ));
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Temporal,
+            "ratio_within: zero-denominator at sample periodic_007",
+        ));
+        // Non-Temporal Inconclusive must NOT bleed into the section.
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Benchmark,
+            "throughput parity inconclusive: zero cpu_time_ns",
+        ));
+        let s = format_temporal_assertions_section(&r);
+        assert!(s.contains("--- temporal assertions ---"));
+        assert!(s.contains("2 temporal assertion entry(ies)"));
+        assert!(s.contains("rate_within: zero-denominator"));
+        assert!(s.contains("ratio_within: zero-denominator"));
+        // Non-Temporal Inconclusive details must NOT bleed in.
+        assert!(!s.contains("throughput parity inconclusive"));
+    }
+
+    /// Mixed Fail + Inconclusive temporal entries surface in
+    /// emission order (Fail stream first, then Inconclusive
+    /// stream), matching the `failure_details().chain(inconclusive_details())`
+    /// iteration order in the implementation.
+    #[test]
+    fn format_temporal_assertions_section_chains_fail_then_inconclusive() {
+        let mut r = crate::assert::AssertResult::pass();
+
+        r.record_fail(AssertDetail::new(
+            DetailKind::Temporal,
+            "fail temporal entry",
+        ));
+        r.record_inconclusive(AssertDetail::new(
+            DetailKind::Temporal,
+            "inc temporal entry",
+        ));
+        let s = format_temporal_assertions_section(&r);
+        assert!(s.contains("2 temporal assertion entry(ies)"));
+        let fail_pos = s.find("fail temporal entry").unwrap();
+        let inc_pos = s.find("inc temporal entry").unwrap();
+        assert!(
+            fail_pos < inc_pos,
+            "Fail must render before Inconclusive (failure_details chained first): {s}"
+        );
+    }
+}

@@ -1,0 +1,5 @@
+error: expected path for bpf_map_write (e.g. BPF_CRASH)
+ --> tests/compile_fail/ktstr_test_bpf_map_write_not_path.rs:3:30
+  |
+3 | #[ktstr_test(bpf_map_write = 42)]
+  |                              ^^

@@ -1,0 +1,281 @@
+# Worker Processes
+
+Workers are the processes that generate load for scenarios. They run
+inside the VM, each in its own cgroup.
+
+## Fork, not threads
+
+Workers are `fork()`ed processes. Cgroups operate on PIDs, so each
+worker must be a separate process to be independently placed in a
+cgroup.
+
+## Two-phase start
+
+Workers wait on a pipe for a "start" signal after fork:
+
+1. Parent forks the worker.
+2. Worker installs SIGUSR1 handler, then blocks on pipe read.
+3. Parent moves the worker to its target cgroup.
+4. Parent writes to the pipe, signaling the worker to start.
+
+This ensures workers run inside their target cgroup from the first
+instruction of their workload.
+
+### Custom work types
+
+`WorkType::Custom` workers follow the same two-phase start (fork,
+cgroup placement, start signal), and the framework applies affinity
+and scheduling policy before handing control to the user function.
+After setup, the `run` function pointer takes over entirely --
+the framework work loop is bypassed.
+
+## Stop protocol
+
+Workers install a SIGUSR1 handler that sets an atomic `STOP` flag. The
+main work loop checks this flag each iteration. On stop:
+
+1. Parent sends SIGUSR1 to all workers.
+2. Workers exit their work loop.
+3. Workers serialize their `WorkerReport` to a pipe.
+4. Parent reads reports and waits for child exit.
+
+## Telemetry
+
+Each worker produces a `WorkerReport`:
+
+```rust,ignore
+pub struct WorkerReport {
+    pub tid: i32,
+    pub work_units: u64,
+    pub cpu_time_ns: u64,
+    pub wall_time_ns: u64,
+    pub off_cpu_ns: u64,
+    pub migration_count: u64,
+    pub cpus_used: BTreeSet<usize>,
+    pub migrations: Vec<Migration>,
+    pub max_gap_ms: u64,
+    pub max_gap_cpu: usize,
+    pub max_gap_at_ms: u64,
+    pub wake_latencies_ns: Vec<u64>,
+    pub wake_sample_total: u64,
+    pub iteration_costs_ns: Vec<u64>,
+    pub iteration_cost_sample_total: u64,
+    pub iterations: u64,
+    pub schedstat_run_delay_ns: u64,
+    pub schedstat_run_count: u64,
+    pub schedstat_cpu_time_ns: u64,
+    pub completed: bool,
+    pub numa_pages: BTreeMap<usize, u64>,
+    pub vmstat_numa_pages_migrated: u64,
+    pub exit_info: Option<WorkerExitInfo>,
+    pub is_messenger: bool,
+    pub group_idx: usize,
+    pub affinity_error: Option<String>,
+}
+
+pub enum WorkerExitInfo {
+    Exited(i32),
+    Signaled(i32),
+    TimedOut,
+    WaitFailed(String),
+    /// Thread-mode worker panicked. Exclusive to `CloneMode::Thread`;
+    /// fork workers surface panics via `Exited(1)` or
+    /// `Signaled(SIGABRT)` depending on the panic strategy.
+    Panicked(String),
+}
+```
+
+`iteration_costs_ns` mirrors `wake_latencies_ns` for per-iteration
+wall-clock cost: a reservoir-sampled vector capped at
+`MAX_WAKE_SAMPLES` entries, paired with `iteration_cost_sample_total`
+for the total observation count when the cap is exceeded.
+`group_idx` is `0` for the primary group and `1..=N` for composed
+`WorkSpec` entries in declaration order (mirrors
+`WorkloadConfig::composed`). `affinity_error` is `Some(reason)`
+when the worker's `sched_setaffinity` (CPU-affinity) setup failed;
+the worker still runs and produces a report but the field documents
+the divergence from the requested affinity contract. `mbind` /
+mem-policy failures are not surfaced here.
+
+Three fields worth calling out explicitly:
+
+- `wake_sample_total` — the TOTAL number of wake-latency
+  observations the worker saw, including samples the reservoir
+  sampler dropped. `wake_latencies_ns` is clamped to at most
+  100_000 entries (`MAX_WAKE_SAMPLES`); on a long run that
+  accumulates more wakes than the cap, the vector stays at the
+  cap while this counter keeps climbing. Host-side consumers
+  reporting "total wakeups observed" read `wake_sample_total`;
+  percentile / CV computations read `wake_latencies_ns`. The
+  100_000 cap is pinned against this doc by the unit test
+  `max_wake_samples_pins_doc_value` in `src/workload/worker/tests.rs`,
+  so a silent change to the constant trips a build-time assertion.
+- `completed` — `true` when the worker reached its natural end
+  (outer loop observed STOP and exited cleanly, or a custom-
+  closure payload returned from its `run`). Sentinel reports
+  synthesised by `stop_and_collect`'s decode-failure fallback carry
+  `false`. Lets consumers distinguish "ran to completion, saw
+  zero iterations" from "died / timed out before recording
+  anything."
+- `is_messenger` — `true` only for the messenger worker in a
+  `FutexFanOut` / `FanOutCompute` group (the single writer that
+  advances the shared generation and issues `futex_wake`).
+  Enables per-worker latency-participation assertions —
+  receivers produce `wake_latencies_ns` entries, messengers
+  record wake-side work but no wake latency.
+
+- `off_cpu_ns = wall_time_ns - cpu_time_ns`
+- `exit_info` is `None` on every live-worker-authored report.
+  `stop_and_collect` synthesises a sentinel `WorkerReport` with
+  `Some(_)` when the worker handed back no (or unparseable) payload
+  — conventional fork workers serialise reports as postcard over the
+  report pipe; `PcommContainer` payloads use serde_json. Either
+  decoder failing or the pipe closing empty triggers the sentinel.
+  The `WorkerExitInfo` enum
+  (`Exited(code)` / `Signaled(signum)` / `TimedOut` /
+  `WaitFailed(String)` / `Panicked` — the `WaitFailed` string carries
+  the underlying `waitpid` errno rendering) preserves the reap shape
+  for post-mortem.
+- Migrations are tracked every 1024 work units: after each outer
+  iteration the worker checks `work_units.is_multiple_of(1024)`
+  and runs the migration-detect body iff that is true. The check
+  runs exactly once per outer iteration, so the effective period
+  in outer iterations is
+  `1024 / gcd(units_per_iter, 1024)`. Default parameters assumed
+  unless noted. The buckets below cover the common variants; other
+  composite work types (ThunderingHerd, PriorityInversion,
+  ProducerConsumerImbalance, RtStarvation, AsymmetricWaker, WakeChain,
+  NumaWorkingSetSweep, NumaMigrationChurn, SignalStorm, PreemptStorm,
+  EpollStorm, IdleChurn, CgroupChurn) follow the same
+  `1024 / gcd(units_per_iter, 1024)` rule with their own per-iteration
+  `work_units` contributions:
+  - **Every outer iteration (period = 1 iter)**: SpinWait (1024),
+    Mixed (1024), Bursty (each outer iter runs `spin_burst(1024)`
+    some number of times inside the `burst_duration` loop — always a
+    multiple of 1024),
+    PipeIo (`burst_iters`=1024), FutexPingPong
+    (`spin_iters`=1024), CachePressure (1024 strided RMW steps),
+    CacheYield (1024 strided RMW steps), CachePipe
+    (`burst_iters`=1024), FutexFanOut receiver
+    (`spin_burst(spin_iters)`, default 1024), AffinityChurn
+    (`spin_iters`=1024), CrossAffinityChurn (`spin_iters`=1024),
+    PolicyChurn (`spin_iters`=1024), AluHot (`ALU_HOT_CHAIN_STEPS`=1024),
+    SmtSiblingSpin (`spin_burst(1024)`), IpcVariance
+    (`period_iters`×(`hot_iters`+`cold_iters`)).
+  - **Every 2 iterations**: NiceSweep (`spin_burst(512)` per iter
+    → `gcd(512, 1024) = 512`).
+  - **Every 4 iterations**: MutexContention
+    (`work_iters`=1024 + `hold_iters`=256 = 1280 per acquire+
+    release → `gcd(1280, 1024) = 256`, period = 4 iters).
+    FanOutCompute messenger (`spin_burst(256)` per wake cycle
+    → same 256-unit gcd). FutexFanOut messenger
+    (`spin_burst(spin_iters)`=1024 before the role split +
+    `spin_burst(FAN_OUT_POST_WAKE_SPIN_ITERS)`=256 = 1280 per iter
+    → `gcd(1280, 1024) = 256`).
+  - **Every 16 iterations**: PageFaultChurn — one persistent
+    `MAP_PRIVATE | MAP_ANONYMOUS` region per worker (default
+    4 MiB via `region_kib`=4096), re-faulted each outer
+    iteration via `madvise(MADV_DONTNEED)`. Each iteration
+    contributes `touches_per_cycle`=256 page writes (each first
+    write after `MADV_DONTNEED` triggers a minor fault; a
+    birthday-collision xorshift64 index may revisit a page
+    already faulted this cycle, so the fault count is a ceiling,
+    not a floor) + `spin_iters`=64 = 320 work units
+    (`gcd(320, 1024) = 64`). The three default values (`region_kib`,
+    `touches_per_cycle`, `spin_iters`) are pinned against this doc
+    by the unit test `page_fault_churn_defaults_pin_doc_values` in
+    `src/workload/worker/tests.rs`, so a silent change to any of
+    them trips a build-time assertion.
+  - **Every 64 iterations**: IoSyncWrite (16 4-KiB writes per
+    iteration ending in `fdatasync` → `gcd(16, 1024) = 16`).
+  - **Every 512 iterations**: IoConvoy (`work_units` += 2 per iter
+    → `gcd(2, 1024) = 2`).
+  - **Every 1024 iterations**: YieldHeavy (1 unit per yield),
+    ForkExit (1 unit per fork+wait), IoRandRead (1 unit/iter via
+    `wrapping_add(1)`), FanOutCompute worker (`operations`=5 matrix
+    multiplies per wake; each `matrix_multiply` folds its C-region
+    accumulator into `work_units` plus a `wrapping_add(1)`, so the
+    per-iter delta is data-dependent — generally >1 rather than a
+    clean 5 — and the worker reaches the 1024 checkpoint at an
+    irregular cadence).
+  - **Phase-inherited**: Sequence inherits whichever phase is
+    currently active — Spin / Yield / Io / AluHot use the same
+    per-unit accounting as the SpinWait / YieldHeavy / IoSyncWrite /
+    AluHot groups above; Sleep contributes no `work_units` and so
+    pauses migration checks while it runs.
+  - **Not tracked by the framework**: Custom workers do not
+    contribute to `work_units` on the framework's behalf —
+    migration tracking fires only if the user's `run` function
+    increments `work_units` and emits migrations directly.
+- Scheduling gaps (`max_gap_ms`, `max_gap_cpu`, `max_gap_at_ms`)
+  record the longest wall-clock interval between consecutive
+  1024-work-unit migration-check points plus the CPU the gap
+  was observed on and its time from start. High values indicate
+  preemption or descheduling near a checkpoint boundary. The
+  checkpoint cadence — and therefore the gap-measurement
+  cadence — is governed by the same `work_units.is_multiple_of(1024)`
+  test that the migration tracker uses, so the effective
+  measurement period in outer iterations matches the per-WorkType
+  tables above.
+
+### Benchmarking fields
+
+Workers collect two categories of timing data:
+
+**Per-wakeup latency** (`wake_latencies_ns`): timestamp-based samples
+recorded around blocking operations. Populated for work types with a
+blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
+(futex wait), FutexFanOut (futex wait, receivers only), FanOutCompute
+(futex wait, workers only — measured as `CLOCK_MONOTONIC` delta from
+messenger's shared timestamp), CacheYield (yield), CachePipe (pipe
+read), IoSyncWrite / IoRandRead / IoConvoy (pread / pwrite / fdatasync
+blocking), NiceSweep (yield), AffinityChurn (yield),
+CrossAffinityChurn (yield), PolicyChurn (yield), MutexContention (futex wait on contended
+acquire), ForkExit (parent's waitpid wait), and Sequence when its
+phases include Sleep, Yield, or Io.
+Each sample is in nanoseconds; most work types use
+`Instant::elapsed()` across the blocking call, while FanOutCompute
+uses `clock_gettime(CLOCK_MONOTONIC)` to measure against the
+messenger's pre-wake timestamp.
+
+**schedstat deltas**: read from `/proc/self/schedstat` at work-loop
+start and end. Three fields:
+- `schedstat_cpu_time_ns` -- delta of field 1 (on-CPU time)
+- `schedstat_run_delay_ns` -- delta of field 2 (time spent waiting
+  for a CPU)
+- `schedstat_run_count` -- delta of field 3 (**pcount** —
+  scheduler-in count: incremented each time the scheduler picks
+  this task to execute, across CFS/EEVDF, FIFO/RR, and sched_ext
+  alike). Not a context-switch count — a task that keeps running
+  on the same CPU without leaving the runqueue does not see
+  pcount advance while it runs. For true context-switch counts
+  read `/proc/<pid>/status`'s `voluntary_ctxt_switches` and
+  `nonvoluntary_ctxt_switches`; the worker reads pcount instead
+  because schedstat delivers it alongside `run_delay` /
+  `cpu_time` in a single file read.
+
+`iterations` counts outer-loop iterations.
+
+### NUMA fields
+
+**`numa_pages`**: per-NUMA-node page counts parsed from
+`/proc/self/numa_maps` after the workload completes. Keyed by node ID.
+Empty when numa_maps is unavailable.
+
+**`vmstat_numa_pages_migrated`**: delta of the `numa_pages_migrated`
+counter from `/proc/vmstat` between pre- and post-workload snapshots.
+Measures cross-node page migrations during the test.
+
+These fields feed the NUMA [checking
+thresholds](../concepts/checking.md#numa-checks).
+
+Custom workers produce their own `WorkerReport`. The framework does
+not populate any telemetry fields for Custom -- migration tracking,
+gap detection, schedstat deltas, NUMA page counts, and iteration
+counters are only present if the user's `run` function fills them.
+
+## RAII cleanup
+
+`WorkloadHandle` implements `Drop`: it sends SIGKILL to all child
+processes and waits for them. This prevents orphaned worker processes
+on error paths.

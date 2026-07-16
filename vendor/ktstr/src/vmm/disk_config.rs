@@ -1,0 +1,1566 @@
+//! Disk configuration for virtio-blk devices.
+//!
+//! [`Filesystem::Raw`] gives the guest an unformatted block device at
+//! `/dev/vda` (a fresh sparse `tempfile()` backing per test). No mount
+//! happens.
+//!
+//! [`Filesystem::Btrfs`] is the entry point for the disk-template
+//! lifecycle. Selecting it routes through
+//! [`crate::vmm::disk_template::ensure_template`]: on cache miss
+//! the framework boots a one-shot template VM that runs
+//! `mkfs.btrfs` against `/dev/vda`, caches the formatted image
+//! under the ktstr cache root, and per-test boots reflink-copy
+//! that template via `FICLONE` so each per-test filesystem starts
+//! pre-formatted with zero host-side mkfs cost. The host never
+//! execs mkfs against a real backing file — the kernel's own mkfs
+//! (run inside the template VM) is the on-disk-format authority.
+//! See [`crate::vmm::disk_template`] for the full cache and
+//! template-VM driver implementation.
+//!
+//! `DiskConfig` is the descriptor — passed by value, copious
+//! defaults, no path field (the framework owns the per-test backing
+//! file's lifecycle).
+
+use std::num::NonZeroU64;
+
+/// Filesystem to format the backing file with.
+///
+/// `Raw` matches the actual on-disk state: no formatting happens, the
+/// guest sees `/dev/vda` as a raw unformatted block device.
+///
+/// Non-`Raw` variants activate the template-cache lifecycle (see
+/// module docs). Selecting one requires the ktstr cache directory
+/// to live on a reflink-capable filesystem (btrfs or xfs) — the
+/// per-test fan-out uses `FICLONE` to clone the cached template
+/// image and would fail on tmpfs/ext4. The host must also have the
+/// formatter named by `Self::mkfs_binary_name` on `PATH` at
+/// template-build time so the template-VM initramfs can pack it.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Filesystem {
+    /// No filesystem; raw block device. The guest sees `/dev/vda` as
+    /// an unformatted volume of the configured capacity. Default.
+    #[default]
+    Raw,
+    /// btrfs filesystem. Per-test backing is a reflink clone of a
+    /// host-cached, guest-formatted btrfs image at the configured
+    /// capacity. On cache miss
+    /// `crate::vmm::disk_template::ensure_template` boots a one-shot
+    /// template VM that runs `mkfs.btrfs /dev/vda` inside the guest,
+    /// caches the formatted image under the ktstr cache root, and
+    /// returns the cached path. On cache hit
+    /// `crate::vmm::disk_template::clone_to_per_test` FICLONE-clones
+    /// the cached template into a per-test tempfile under the same
+    /// cache filesystem. The cache directory must live on a btrfs/xfs
+    /// mount, and `mkfs.btrfs` must be on the host `PATH` at
+    /// template-build time. See `crate::vmm::disk_template`.
+    Btrfs,
+}
+
+impl Filesystem {
+    /// Short identifier used in cache keys and diagnostics. The
+    /// values are intentionally short (≤8 chars), kebab-free, and
+    /// stable across rebuilds — they participate in on-disk cache
+    /// path names, so renaming a variant invalidates already-cached
+    /// templates. New variants must add a new tag rather than
+    /// reusing one.
+    pub(crate) fn cache_tag(self) -> &'static str {
+        match self {
+            Filesystem::Raw => "raw",
+            Filesystem::Btrfs => "btrfs",
+        }
+    }
+
+    /// Userspace mkfs binary name to pack into the template-VM
+    /// initramfs for variants that require pre-formatting.
+    ///
+    /// Returns `Some(name)` for variants whose template-build VM
+    /// execs an `mkfs.<fstype>` against `/dev/vda` inside the guest;
+    /// `None` for variants that need no formatter (`Raw`). The
+    /// exhaustive match here forces every future `Filesystem`
+    /// variant to wire its mkfs lookup at compile time —
+    /// [`crate::vmm::disk_template::locate_host_mkfs`] takes the
+    /// returned name verbatim and PATH-resolves it, so a new
+    /// variant that forgets to declare a binary surfaces as a
+    /// non-exhaustive-match build error rather than as a runtime
+    /// "binary not found" diagnostic at template-build time.
+    ///
+    /// # Per-variant wiring points
+    ///
+    /// A new `Filesystem` variant that requires pre-formatting wires up
+    /// four per-variant match arms. All are exhaustive matches over
+    /// `Filesystem`, so a missing arm is a non-exhaustive-match build
+    /// error rather than a runtime surprise; this paragraph exists so an
+    /// implementer reading `mkfs_binary_name` sees the companions up
+    /// front:
+    ///
+    /// - `mkfs_binary_name` (here) — the `mkfs.<fstype>` binary name.
+    /// - `mkfs_package_hint` in `src/vmm/disk_template.rs` — the
+    ///   distro-package hint surfaced in the "binary not found"
+    ///   diagnostic (e.g. `btrfs-progs` for `Btrfs`), used by
+    ///   [`crate::vmm::disk_template::locate_host_mkfs`].
+    /// - [`superblock_magic`](Self::superblock_magic) — the on-disk
+    ///   magic that content-validates a built or cached image. A
+    ///   pre-formatting variant that returns `None` there skips
+    ///   content-validation, silently reviving the unformatted-image
+    ///   bug class for that variant.
+    /// - [`cache_tag`](Self::cache_tag) — the short identifier baked
+    ///   into the on-disk cache key.
+    pub(crate) fn mkfs_binary_name(self) -> Option<&'static str> {
+        match self {
+            Filesystem::Raw => None,
+            Filesystem::Btrfs => Some("mkfs.btrfs"),
+        }
+    }
+
+    /// On-disk superblock magic for content-validating a cached or
+    /// freshly-built template image, as `(byte_offset, magic_u64)`.
+    ///
+    /// The host reads 8 bytes at `byte_offset`, interprets them
+    /// little-endian, and compares to `magic_u64`. A 0-byte / all-zero
+    /// image — an unformatted staging file a prior build published, or a
+    /// torn write — reads back `0` and is rejected before it can strand
+    /// every per-test clone with a `-EINVAL` mount (the guest kernel's
+    /// superblock validator rejects the missing magic). Returns `None`
+    /// for variants with no on-disk filesystem ([`Filesystem::Raw`]),
+    /// which are never content-validated.
+    ///
+    /// btrfs: `magic` is a `__le64` whose value is `BTRFS_MAGIC =
+    /// 0x4D5F53665248425F` ("_BHRfS_M"). It sits at offset `0x10040` —
+    /// the superblock starts at `BTRFS_SUPER_INFO_OFFSET (65536)` and
+    /// `struct btrfs_super_block` places `magic` after `csum[32]` +
+    /// `fsid[16]` + `bytenr (8)` + `flags (8)` = +64. (Verified against
+    /// the kernel `include/uapi/linux/btrfs_tree.h` struct + the
+    /// `BTRFS_MAGIC` / `BTRFS_CSUM_SIZE` / `BTRFS_FSID_SIZE` defines.)
+    /// The guest kernel rejects a wrong magic in `btrfs_validate_super`
+    /// (fs/btrfs/disk-io.c) with `-EINVAL`; this host check fails the
+    /// same image up front.
+    pub(crate) fn superblock_magic(self) -> Option<(u64, u64)> {
+        match self {
+            Filesystem::Raw => None,
+            Filesystem::Btrfs => Some((0x1_0040, 0x4D5F_5366_5248_425F)),
+        }
+    }
+}
+
+/// IO throttle for one disk. Each field caps a separate dimension;
+/// `None` disables that dimension's throttle. All `None` =
+/// unthrottled (the device runs at host-pread/pwrite speed).
+///
+/// Burst capacity is the token-bucket capacity (peak instantaneous
+/// burst the device will absorb before throttling kicks in). Refill
+/// rate is the steady-state allowance (`iops` / `bytes_per_sec`).
+/// When `*_burst_capacity` is `None`, the bucket capacity equals the
+/// refill rate, giving a 1-second burst — the historical default.
+/// Setting a burst capacity larger than the refill rate models a
+/// device that tolerates transient spikes (e.g. a 1-second steady
+/// rate of 1000 IOPS with a 5000-IOPS burst capacity allows a
+/// 5-second-equivalent burst from a full bucket). A burst capacity
+/// without a corresponding rate is meaningless (a bucket that never
+/// refills); [`DiskThrottle::validate`] rejects it.
+///
+/// Throttle exhaustion stalls the request internally and retries via
+/// a timer — it is not surfaced to the guest as `VIRTIO_BLK_S_IOERR`.
+///
+/// # Worked example: cloud-style 1000 IOPS / 10 MiB·s with 5× burst
+///
+/// Model a "1000 IOPS sustained, tolerate a brief unrestricted
+/// spike from a quiescent device" disk:
+///
+/// ```
+/// use ktstr::prelude::*;
+///
+/// let disk = DiskConfig::default()
+///     // Steady-state allowance — bucket refill rate.
+///     .iops(1_000)
+///     // Peak burst — bucket capacity. 5× the refill rate (5_000 ops)
+///     // is the maximum number of unrestricted ops the device will
+///     // absorb from a full bucket before throttling kicks in.
+///     .iops_burst_capacity(5_000)
+///     // Steady-state bandwidth: 10 MiB/s = 10 * 1024 * 1024 bytes/s.
+///     .bytes_per_sec(10 * 1024 * 1024)
+///     // Bandwidth burst — 5× the rate, mirroring the iops ratio.
+///     .bytes_burst_capacity(50 * 1024 * 1024);
+/// disk.throttle.validate().expect("burst >= rate, rate set");
+/// ```
+///
+/// At VM build time the buckets are seeded full (start of the test =
+/// "quiescent device"); a burst-friendly workload draws the bucket
+/// down at peak rate until empty, then is rate-limited to the refill
+/// rate from then on.
+///
+/// The `5_000`-op burst capacity is NOT "5 seconds at 1000 IOPS"
+/// in any real-time sense — the bucket drains at whatever rate the
+/// guest workload submits ops, which is usually much faster than
+/// the refill rate. A workload submitting 10_000 IOPS empties the
+/// 5_000-op bucket in ~0.5s, after which the device steady-states
+/// at the 1000-IOPS refill rate. The "5 seconds" framing only
+/// applies as a hypothetical lower bound: a workload submitting
+/// exactly the refill rate (1000 IOPS) would never drain the
+/// bucket, and a workload submitting 2× the refill rate would
+/// drain a 5×-rate bucket over ~5 seconds. Most real workloads
+/// drain bursts much faster than that.
+///
+/// # Picking values
+///
+/// - **`iops`** — peak operations the device must sustain. Includes
+///   reads, writes, and flushes (each = 1 op).
+/// - **`bytes_per_sec`** — peak bandwidth the device must sustain
+///   for read+write data combined. Flushes do not count toward
+///   bandwidth.
+/// - **`*_burst_capacity`** — how long a burst from a full bucket
+///   should run before throttling kicks in. `burst = N * rate` gives
+///   ~N seconds of unrestricted IO from a quiescent device. Leave
+///   `None` to default to `burst = rate` (1-second burst, the
+///   pre-burst-feature behaviour).
+///
+/// # Constraint summary
+///
+/// Both rules are enforced by [`DiskThrottle::validate`] (run by
+/// `crate::vmm::KtstrVmBuilder::build` before the backing file is
+/// allocated):
+///
+/// - `*_burst_capacity` must be `>= *_refill_rate` when both are
+///   set; a capacity below the refill rate would silently cap the
+///   steady-state at the lower capacity instead of the configured
+///   rate.
+/// - `*_burst_capacity` must not be set without its matching refill
+///   rate; a one-shot bucket that never refills doesn't model any
+///   useful throttle.
+///
+/// Clearing a refill rate via the builder (`iops(0)` /
+/// `bytes_per_sec(0)`) auto-clears its matching `*_burst_capacity`
+/// so the second rule never trips on a cleared-rate chain.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct DiskThrottle {
+    /// Maximum operations per second (1 read = 1 op, 1 write = 1
+    /// op, 1 flush = 1 op). Refill rate of the IOPS token bucket.
+    ///
+    /// Type-enforced nonzero: `Option<NonZeroU64>` makes
+    /// `Some(0) = unlimited` impossible to express at the type
+    /// level. To disable IOPS throttling, use `None` (or set 0
+    /// through the builder, which the builder converts to `None`).
+    pub iops: Option<NonZeroU64>,
+    /// Maximum bytes per second across read+write data. Refill rate
+    /// of the bandwidth token bucket.
+    ///
+    /// Type-enforced nonzero, same reasoning as `iops`.
+    pub bytes_per_sec: Option<NonZeroU64>,
+    /// IOPS bucket capacity (peak burst). When `None`, capacity
+    /// equals the `iops` refill rate (1-second burst). When `Some`,
+    /// the value must be `>= iops` (a capacity below the refill rate
+    /// would discard refilled tokens immediately and effectively
+    /// reduce the steady-state rate); [`DiskThrottle::validate`]
+    /// enforces this. Has no effect when `iops` is `None`.
+    ///
+    /// Values above `i64::MAX` are accepted but the `TokenBucket`
+    /// seed is clamped to `i64::MAX` at construction — the effective
+    /// initial burst is ~9.2 quintillion, immaterial for realistic
+    /// settings.
+    pub iops_burst_capacity: Option<NonZeroU64>,
+    /// Bandwidth bucket capacity (peak burst, in bytes). When
+    /// `None`, capacity equals the `bytes_per_sec` refill rate
+    /// (1-second burst). When `Some`, the value must be
+    /// `>= bytes_per_sec`. Has no effect when `bytes_per_sec` is
+    /// `None`.
+    ///
+    /// Values above `i64::MAX` are accepted but the `TokenBucket`
+    /// seed is clamped to `i64::MAX` at construction — the effective
+    /// initial burst is ~9.2 exabytes, immaterial for realistic
+    /// settings.
+    pub bytes_burst_capacity: Option<NonZeroU64>,
+}
+
+/// Throttle dimension a [`DiskThrottleValidationError`] applies to.
+///
+/// `Iops` covers `iops` / `iops_burst_capacity`; `Bytes` covers
+/// `bytes_per_sec` / `bytes_burst_capacity`. The discriminant lets
+/// callers route a programmatic recovery (e.g. clearing the offending
+/// burst) without parsing the rendered error message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThrottleDimension {
+    /// IOPS dimension — `iops` refill rate, `iops_burst_capacity`
+    /// bucket capacity.
+    Iops,
+    /// Bandwidth dimension — `bytes_per_sec` refill rate,
+    /// `bytes_burst_capacity` bucket capacity.
+    Bytes,
+}
+
+impl ThrottleDimension {
+    /// Field name of the offending burst capacity. Stable wire
+    /// identifier — matches the [`DiskThrottle`] field name and the
+    /// builder method name on [`DiskConfig`] so error consumers can
+    /// echo it back to the user as the field they need to change.
+    pub fn burst_field(self) -> &'static str {
+        match self {
+            ThrottleDimension::Iops => "iops_burst_capacity",
+            ThrottleDimension::Bytes => "bytes_burst_capacity",
+        }
+    }
+
+    /// Field name of the matching refill rate. Symmetric with
+    /// [`Self::burst_field`].
+    pub fn rate_field(self) -> &'static str {
+        match self {
+            ThrottleDimension::Iops => "iops",
+            ThrottleDimension::Bytes => "bytes_per_sec",
+        }
+    }
+}
+
+/// Validation failure for [`DiskThrottle::validate`].
+///
+/// Returned by [`DiskThrottle::validate`] when a throttle/burst
+/// chain violates the constraints documented on [`DiskThrottle`].
+/// The `Display` impl carries the same actionable text the previous
+/// `String`-returning shape did (with the ", or pass 0 to clear …"
+/// remediation hint preserved) so callers that bubble the error
+/// through `anyhow::Error` and match on the rendered message keep
+/// working.
+///
+/// Tests that need to assert on a specific failure variant downcast
+/// via `err.downcast_ref::<DiskThrottleValidationError>()` (when the
+/// error is wrapped in `anyhow`) or pattern-match the enum directly.
+/// The [`dimension()`](Self::dimension) accessor exposes which
+/// dimension (iops/bytes) tripped the rule for callers that route
+/// programmatic recovery (e.g. clear the offending
+/// `*_burst_capacity` and retry).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum DiskThrottleValidationError {
+    /// `*_burst_capacity` is set to a value strictly below the
+    /// corresponding `*` refill rate. A bucket with capacity below
+    /// its refill rate cannot hold a full second of refilled
+    /// tokens, so the effective steady-state rate would silently be
+    /// the capacity, not the configured rate.
+    #[error(
+        "{burst_field} ({burst}) must be >= {rate_field} ({rate}), \
+         or pass 0 to clear the burst override",
+        burst_field = dimension.burst_field(),
+        rate_field = dimension.rate_field(),
+    )]
+    BurstBelowRate {
+        /// Throttle dimension this failure applies to.
+        dimension: ThrottleDimension,
+        /// The offending burst-capacity value.
+        burst: u64,
+        /// The refill rate the burst was compared against.
+        rate: u64,
+    },
+    /// `*_burst_capacity` is set with no matching `*` refill rate.
+    /// A bucket with no refill rate is a functionally unbounded
+    /// one-shot capacity, which does not match any useful
+    /// throttling model.
+    #[error(
+        "{burst_field} set without {rate_field} refill rate, \
+         or pass 0 to clear the burst override",
+        burst_field = dimension.burst_field(),
+        rate_field = dimension.rate_field(),
+    )]
+    BurstWithoutRate {
+        /// Throttle dimension this failure applies to.
+        dimension: ThrottleDimension,
+    },
+}
+
+impl DiskThrottleValidationError {
+    /// Throttle dimension (iops/bytes) the failure applies to. Lets
+    /// callers route a programmatic recovery without parsing the
+    /// rendered message — e.g. "clear the offending burst override
+    /// and re-validate" can dispatch on this without string-matching
+    /// `iops_burst_capacity` vs `bytes_burst_capacity`.
+    pub fn dimension(&self) -> ThrottleDimension {
+        match self {
+            DiskThrottleValidationError::BurstBelowRate { dimension, .. } => *dimension,
+            DiskThrottleValidationError::BurstWithoutRate { dimension } => *dimension,
+        }
+    }
+}
+
+impl DiskThrottle {
+    /// Non-panicking validation of throttle/burst consistency.
+    ///
+    /// Rejects burst capacities below their corresponding refill
+    /// rate. A bucket with capacity below its refill rate cannot
+    /// hold a full second of refilled tokens, so the effective
+    /// steady-state rate would silently be the capacity, not the
+    /// configured rate — a user who sets `iops(1000).iops_burst_capacity(500)`
+    /// would expect 1000 IOPS and silently get 500.
+    ///
+    /// A burst capacity set without a corresponding rate is also
+    /// rejected: a bucket with no refill rate is functionally
+    /// unbounded one-shot capacity, which does not match any
+    /// useful throttling model.
+    ///
+    /// Returns [`DiskThrottleValidationError`] on failure — a typed
+    /// enum so callers can pattern-match the failure mode (e.g.
+    /// route a programmatic recovery via the
+    /// [`dimension()`](DiskThrottleValidationError::dimension)
+    /// accessor) rather than string-matching the rendered message.
+    /// The `Display` impl preserves the wording of the prior
+    /// `String`-returning shape, including the ", or pass 0 to
+    /// clear the burst override" remediation hint, so anyhow-bubbled
+    /// callers that match on the rendered text still work.
+    pub fn validate(&self) -> Result<(), DiskThrottleValidationError> {
+        if let Some(burst) = self.iops_burst_capacity {
+            match self.iops {
+                Some(rate) if burst < rate => {
+                    return Err(DiskThrottleValidationError::BurstBelowRate {
+                        dimension: ThrottleDimension::Iops,
+                        burst: burst.get(),
+                        rate: rate.get(),
+                    });
+                }
+                None => {
+                    return Err(DiskThrottleValidationError::BurstWithoutRate {
+                        dimension: ThrottleDimension::Iops,
+                    });
+                }
+                _ => {}
+            }
+        }
+        if let Some(burst) = self.bytes_burst_capacity {
+            match self.bytes_per_sec {
+                Some(rate) if burst < rate => {
+                    return Err(DiskThrottleValidationError::BurstBelowRate {
+                        dimension: ThrottleDimension::Bytes,
+                        burst: burst.get(),
+                        rate: rate.get(),
+                    });
+                }
+                None => {
+                    return Err(DiskThrottleValidationError::BurstWithoutRate {
+                        dimension: ThrottleDimension::Bytes,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-disk config. `Default` is raw 256 MiB device on `/dev/vda`;
+/// formatting and auto-mount are deferred.
+///
+/// No backing-file path field: the framework owns the per-test
+/// backing file (`tempfile()` for `Raw`, FICLONE-cloned template
+/// for `Btrfs`). See module docs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DiskConfig {
+    /// Advertised capacity in mebibytes (MiB). `capacity_bytes()`
+    /// computes `capacity_mib << 20`. 256 MiB default capacity.
+    /// Sized to accommodate common guest filesystem formatters;
+    /// smaller values are accepted but may cause `mkfs` failures
+    /// inside the template VM (see
+    /// `crate::vmm::disk_template::build_template_via_vm`) for
+    /// `Filesystem::Btrfs`.
+    pub capacity_mib: u32,
+    /// Filesystem to format the per-test backing with. `Raw` leaves
+    /// the device unformatted; `Btrfs` routes through the
+    /// template-cache lifecycle.
+    pub filesystem: Filesystem,
+    /// IO throttle. Default unthrottled.
+    pub throttle: DiskThrottle,
+    /// Read-only at the device level — the device advertises
+    /// VIRTIO_BLK_F_RO so the guest mounts read-only. Useful for
+    /// tests that need protection against accidental writes.
+    pub read_only: bool,
+    /// Optional human-readable label for this disk. `None` (the
+    /// default) is an anonymous disk addressable only by index. A
+    /// name lets WorkType variants reference the disk symbolically
+    /// (e.g. `"data"`, `"log"`) instead of by index, which keeps
+    /// tests stable across topology rearrangements.
+    ///
+    /// Stored as `Option<&'static str>` so `DiskConfig` is
+    /// const-constructible — `DiskConfig::DEFAULT.with_name("data")`
+    /// works in a `static` or `const` initializer, which the
+    /// `#[ktstr_test(disk = ...)]` macro relies on. The field is
+    /// `#[serde(skip)]` because `&'static str` can't be deserialized
+    /// from arbitrary input without leaking; the name is operator
+    /// metadata that the framework computes on-the-fly from the
+    /// declaration, not state that needs to round-trip through
+    /// sidecar JSON. Sidecar consumers that need to associate a
+    /// disk identity with serialized data should use the disk's
+    /// index instead.
+    #[serde(skip)]
+    pub name: Option<&'static str>,
+    /// Opt out of guest-side auto-mount. Default `false` means a
+    /// non-`Raw` disk is auto-mounted at `/mnt/disk0` by the guest
+    /// init (see
+    /// `crate::vmm::rust_init::auto_mount_data_disks`); setting
+    /// `true` suppresses the auto-mount cmdline tokens and leaves
+    /// `/dev/vda` raw to the test author. Has no effect for
+    /// `Filesystem::Raw` disks (there is nothing to mount). The
+    /// only honest reason to flip this is a test that wants to
+    /// drive the mount path itself (e.g. exercise mount-option
+    /// fuzzing or fail-injection on the kernel mount syscall).
+    pub no_auto_mount: bool,
+}
+
+impl Default for DiskConfig {
+    /// 256 MiB, [`Filesystem::Raw`], no throttle. The `Raw` default
+    /// keeps the on-host cost minimal — no template-VM build, no
+    /// cache directory required — and the per-test backing is a
+    /// fresh sparse `tempfile()` per VM (see
+    /// `crate::vmm::KtstrVm::init_virtio_blk`).
+    ///
+    /// # Memory footprint
+    ///
+    /// The 256 MiB sparse file lives under the host's `TMPDIR`
+    /// (`tempfile()`); actual host disk/RAM consumption equals the
+    /// bytes the guest writes, not the advertised capacity. On
+    /// tmpfs-backed `TMPDIR` (the default on most Linux distros), a
+    /// fully-written disk consumes 256 MiB of host **RAM** per test
+    /// — operators running large topologies should size host memory
+    /// accordingly or override `TMPDIR` to a disk-backed path.
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl DiskConfig {
+    /// Const-evaluable default — same values as [`Default::default`]
+    /// but usable in `static` / `const` initializers. Required for
+    /// the `#[ktstr_test(disk = ...)]` macro surface: the macro
+    /// emits a `static` containing a `DiskConfig`, which must be
+    /// const-constructible.
+    ///
+    /// Spread via `..DiskConfig::DEFAULT` in struct-update syntax,
+    /// or chain const setters (`DiskConfig::DEFAULT.with_name("data")`).
+    pub const DEFAULT: Self = Self {
+        capacity_mib: 256,
+        filesystem: Filesystem::Raw,
+        throttle: DiskThrottle::DEFAULT,
+        read_only: false,
+        name: None,
+        no_auto_mount: false,
+    };
+}
+
+impl DiskThrottle {
+    /// Const-evaluable default — all `None` (unthrottled), matching
+    /// [`Default::default`]. Required so `DiskConfig::DEFAULT` can be
+    /// `const`.
+    pub const DEFAULT: Self = Self {
+        iops: None,
+        bytes_per_sec: None,
+        iops_burst_capacity: None,
+        bytes_burst_capacity: None,
+    };
+}
+
+impl DiskConfig {
+    /// Set capacity in mebibytes (MiB). The argument is interpreted
+    /// as binary mebibytes per `Self::capacity_bytes`, not decimal
+    /// megabytes.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn capacity_mib(mut self, mib: u32) -> Self {
+        self.capacity_mib = mib;
+        self
+    }
+
+    /// Select the on-disk filesystem.
+    ///
+    /// `Filesystem::Raw` (the default) leaves the device unformatted.
+    /// `Filesystem::Btrfs` routes through
+    /// `crate::vmm::disk_template::ensure_template`: on cache miss
+    /// the framework boots a one-shot template VM that runs
+    /// `mkfs.btrfs` inside the guest, caches the formatted image,
+    /// and per-test boots reflink-clone it. The lifecycle requires
+    /// a reflink-capable cache directory (btrfs or xfs) and a host
+    /// `mkfs.btrfs` binary on `PATH` at template-build time. See
+    /// the module-level docs and `crate::vmm::disk_template`.
+    ///
+    /// # Disk-template lifecycle
+    ///
+    /// For `Filesystem::Btrfs`, the per-test backing file is produced
+    /// in three stages — none of which the test author needs to drive
+    /// explicitly:
+    ///
+    /// 1. **Cache lookup** —
+    ///    `disk_template::ensure_template`
+    ///    keys off `(filesystem, capacity)` and returns the cached
+    ///    image path on hit. See the module docs at
+    ///    `crate::vmm::disk_template` for the cache-key encoding
+    ///    and on-disk layout.
+    /// 2. **Template build (cache miss)** —
+    ///    `disk_template::build_template_via_vm`
+    ///    boots a one-shot guest with the host's `mkfs.btrfs` packed
+    ///    into the initramfs; the guest formats `/dev/vda` against
+    ///    a sparse staging image, and the framework atomically moves
+    ///    the formatted image into the cache via
+    ///    `disk_template::store_atomic`.
+    ///    The host never execs `mkfs.btrfs` against a real backing
+    ///    file — the guest kernel is the on-disk-format authority.
+    /// 3. **Per-test fan-out** —
+    ///    `disk_template::clone_to_per_test`
+    ///    `FICLONE`-clones the cached image into a tempfile under
+    ///    the cache root. The clone is O(metadata) and copy-on-write
+    ///    at the extent level, so per-test writes never touch the
+    ///    cached template.
+    ///
+    /// Stage 3 requires the cache directory to live on a reflink-
+    /// capable filesystem (btrfs or xfs); see
+    /// `disk_template::verify_cache_dir_supports_reflink`
+    /// for the gate and
+    /// `crate::vmm::KtstrVmBuilder::disk` for the full
+    /// builder-side wiring.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn filesystem(mut self, fs: Filesystem) -> Self {
+        self.filesystem = fs;
+        self
+    }
+
+    /// Set IOPS throttle. Passing 0 disables IOPS throttling
+    /// (equivalent to `None`). To throttle near-zero, use `iops(1)`.
+    /// There is no "block all IO" mode — the minimum throttled rate
+    /// is 1 op/sec. Any positive value is wrapped in `NonZeroU64`.
+    ///
+    /// Clearing the rate (`iops(0)`) also clears the matching
+    /// `iops_burst_capacity` — a burst capacity without a refill
+    /// rate is invalid (caught by [`DiskThrottle::validate`]) and
+    /// keeping a stale burst around after the user explicitly
+    /// disabled the rate is a footgun: the next `validate()` call
+    /// would fail with a less-helpful "burst without rate" error
+    /// rather than the user's intent (a fully-unthrottled bucket).
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn iops(mut self, iops: u64) -> Self {
+        self.throttle.iops = NonZeroU64::new(iops);
+        if self.throttle.iops.is_none() {
+            self.throttle.iops_burst_capacity = None;
+        }
+        self
+    }
+
+    /// Set bandwidth throttle (bytes per second). A zero value
+    /// disables bandwidth throttling (stored as `None`); any
+    /// positive value is wrapped in `NonZeroU64`.
+    ///
+    /// Clearing the rate (`bytes_per_sec(0)`) also clears the
+    /// matching `bytes_burst_capacity` for the same reason as
+    /// `iops` — a burst without a rate is invalid and stale-burst
+    /// retention turns a deliberate "drop the throttle" into a
+    /// validate-time failure.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn bytes_per_sec(mut self, bytes_per_sec: u64) -> Self {
+        self.throttle.bytes_per_sec = NonZeroU64::new(bytes_per_sec);
+        if self.throttle.bytes_per_sec.is_none() {
+            self.throttle.bytes_burst_capacity = None;
+        }
+        self
+    }
+
+    /// Set IOPS burst capacity (token-bucket peak). A zero value
+    /// clears the burst override (stored as `None`), reverting to
+    /// the default 1-second burst (capacity equals refill rate).
+    /// Any positive value is wrapped in `NonZeroU64`.
+    ///
+    /// The capacity must be `>= iops` when both are set, and must
+    /// not be set without `iops`. Both rules are enforced by
+    /// [`DiskThrottle::validate`] at VM build time, not by the
+    /// builder — the builder is order-independent (a user may set
+    /// burst before rate). Tests should call `validate()` after
+    /// chaining, or construct an invalid config and observe the
+    /// error from VM build.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn iops_burst_capacity(mut self, capacity: u64) -> Self {
+        self.throttle.iops_burst_capacity = NonZeroU64::new(capacity);
+        self
+    }
+
+    /// Set bandwidth burst capacity in bytes (token-bucket peak).
+    /// A zero value clears the burst override (stored as `None`),
+    /// reverting to the default 1-second burst. Any positive value
+    /// is wrapped in `NonZeroU64`.
+    ///
+    /// The capacity must be `>= bytes_per_sec` when both are set,
+    /// and must not be set without `bytes_per_sec`. Both rules are
+    /// enforced by [`DiskThrottle::validate`] at VM build time, not
+    /// by the builder.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn bytes_burst_capacity(mut self, capacity: u64) -> Self {
+        self.throttle.bytes_burst_capacity = NonZeroU64::new(capacity);
+        self
+    }
+
+    /// Mark the disk read-only (advertises `VIRTIO_BLK_F_RO`).
+    /// Default is read-write; this builder takes no argument (no
+    /// boolean footgun) and only flips the flag on. To return to
+    /// read-write, drop the call or reconstruct from
+    /// `DiskConfig::default()`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    /// Attach a human-readable label to this disk. WorkType variants
+    /// that need to address a specific disk (e.g. one of several
+    /// attached) can resolve the name instead of relying on
+    /// attachment order. Default is anonymous (`None`); calling
+    /// `.with_name(...)` sets it.
+    ///
+    /// The name also drives the guest auto-mount path: a disk
+    /// named `"data"` auto-mounts at `/mnt/data` instead of the
+    /// default `/mnt/disk0`. See [`Self::no_auto_mount`] to opt
+    /// out of auto-mount entirely.
+    ///
+    /// Takes `&'static str` so the builder is `const fn` —
+    /// `DiskConfig::DEFAULT.with_name("data")` can spread into a
+    /// `static` initializer. String literals are `&'static`; tests
+    /// needing a dynamic name should build the disk programmatically
+    /// rather than going through this builder.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub const fn with_name(mut self, name: &'static str) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    /// Suppress the guest-side auto-mount of this disk. Default
+    /// behavior auto-mounts a non-`Raw` disk at the path returned
+    /// by `Self::auto_mount_path`; calling this method flips
+    /// the flag on. Useful for tests that want raw access to
+    /// `/dev/vda` after a host-driven mkfs (e.g. mount-option
+    /// fuzzing, deliberate mount-failure injection, manual
+    /// subvolume traversal).
+    ///
+    /// No-op for `Filesystem::Raw` disks (there is nothing to
+    /// mount). The flag is honored at cmdline-emission time in
+    /// `crate::vmm::KtstrVmBuilder::build`: when set, the
+    /// `KTSTR_DISK0_FS` / `KTSTR_DISK0_MOUNT` / `KTSTR_DISK0_RO`
+    /// tokens are not emitted, and the guest's
+    /// `crate::vmm::rust_init::auto_mount_data_disks` short-
+    /// circuits at the missing-token check.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn no_auto_mount(mut self) -> Self {
+        self.no_auto_mount = true;
+        self
+    }
+
+    /// Resolve the guest-side mount path for this disk. Returns
+    /// `/mnt/<name>` when [`Self::name`] is set, `/mnt/disk0`
+    /// otherwise. Used by the cmdline emission to populate the
+    /// `KTSTR_DISK0_MOUNT` token consumed by the guest's
+    /// `crate::vmm::rust_init::auto_mount_data_disks`.
+    #[allow(dead_code)]
+    pub(crate) fn auto_mount_path(&self) -> String {
+        match self.name {
+            Some(n) => format!("/mnt/{n}"),
+            None => "/mnt/disk0".to_string(),
+        }
+    }
+
+    /// Capacity in bytes (`capacity_mib << 20`). Used by the device
+    /// for the config-space `capacity` field.
+    pub(crate) fn capacity_bytes(&self) -> u64 {
+        (self.capacity_mib as u64) << 20
+    }
+
+    /// Capacity in 512-byte sectors.
+    ///
+    /// `dead_code` allow: only the in-file `#[cfg(test)]` tests
+    /// consume this; the production virtio-blk path uses
+    /// [`Self::capacity_bytes`] and divides by `VIRTIO_BLK_SECTOR_SIZE`
+    /// at the device layer.
+    #[allow(dead_code)]
+    pub(crate) fn capacity_sectors(&self) -> u64 {
+        self.capacity_bytes() / 512
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_256mib_raw() {
+        let d = DiskConfig::default();
+        assert_eq!(d.capacity_mib, 256);
+        assert_eq!(d.filesystem, Filesystem::Raw);
+        assert_eq!(d.throttle, DiskThrottle::default());
+        assert!(!d.read_only);
+        assert!(d.name.is_none());
+    }
+
+    #[test]
+    fn capacity_helpers() {
+        let d = DiskConfig::default();
+        assert_eq!(d.capacity_bytes(), 256 * 1024 * 1024);
+        assert_eq!(d.capacity_sectors(), 524_288);
+
+        let d = DiskConfig::default().capacity_mib(512);
+        assert_eq!(d.capacity_bytes(), 512 * 1024 * 1024);
+        assert_eq!(d.capacity_sectors(), 1_048_576);
+    }
+
+    #[test]
+    fn filesystem_builder_sets_variant() {
+        let d = DiskConfig::default().filesystem(Filesystem::Btrfs);
+        assert_eq!(d.filesystem, Filesystem::Btrfs);
+        // Builder is overwriting (not OR-ing) — last call wins.
+        let d = d.filesystem(Filesystem::Raw);
+        assert_eq!(d.filesystem, Filesystem::Raw);
+    }
+
+    #[test]
+    fn builder_chain() {
+        let d = DiskConfig::default()
+            .capacity_mib(128)
+            .iops(1000)
+            .bytes_per_sec(10 * 1024 * 1024)
+            .read_only();
+        assert_eq!(d.capacity_mib, 128);
+        assert_eq!(d.filesystem, Filesystem::Raw);
+        assert_eq!(d.throttle.iops, NonZeroU64::new(1000));
+        assert_eq!(d.throttle.bytes_per_sec, NonZeroU64::new(10 * 1024 * 1024));
+        assert!(d.read_only);
+    }
+
+    #[test]
+    fn iops_zero_becomes_none() {
+        // The NonZeroU64 type makes Some(0) impossible. The builder
+        // accepts u64 for ergonomics and converts 0 → None
+        // (= unthrottled) at the type boundary.
+        let d = DiskConfig::default().iops(0);
+        assert!(d.throttle.iops.is_none());
+        let d = DiskConfig::default().bytes_per_sec(0);
+        assert!(d.throttle.bytes_per_sec.is_none());
+    }
+
+    #[test]
+    fn filesystem_default_is_raw() {
+        // Default::default() must produce a working v0 config — the
+        // `Filesystem::Raw` default matches the actual v0 behaviour
+        // (no formatting). #[default] attribute on the enum variant
+        // drives this; this test pins it so a future patch that
+        // adds a non-Raw variant and changes `#[default]` (regressing
+        // the "default works" guarantee) surfaces here.
+        assert_eq!(Filesystem::default(), Filesystem::Raw);
+    }
+
+    #[test]
+    fn filesystem_serde_snake_case() {
+        assert_eq!(serde_json::to_string(&Filesystem::Raw).unwrap(), r#""raw""#);
+        assert_eq!(
+            serde_json::to_string(&Filesystem::Btrfs).unwrap(),
+            r#""btrfs""#
+        );
+        let parsed: Filesystem = serde_json::from_str(r#""raw""#).unwrap();
+        assert_eq!(parsed, Filesystem::Raw);
+        let parsed: Filesystem = serde_json::from_str(r#""btrfs""#).unwrap();
+        assert_eq!(parsed, Filesystem::Btrfs);
+    }
+
+    #[test]
+    fn filesystem_cache_tag_round_trips_serde_name() {
+        // The cache_tag is the on-disk identifier used in the
+        // template-cache key. Pinning that it matches the serde
+        // serialization keeps the two name spaces aligned — a future
+        // `#[serde(rename = "...")]` change must update cache_tag in
+        // lock-step or the cache stops finding old entries.
+        for fs in [Filesystem::Raw, Filesystem::Btrfs] {
+            let json = serde_json::to_string(&fs).unwrap();
+            let stripped = json.trim_matches('"');
+            assert_eq!(fs.cache_tag(), stripped, "cache_tag drift for {fs:?}");
+        }
+    }
+
+    #[test]
+    fn throttle_default_is_unthrottled() {
+        let t = DiskThrottle::default();
+        assert!(t.iops.is_none());
+        assert!(t.bytes_per_sec.is_none());
+        assert!(t.iops_burst_capacity.is_none());
+        assert!(t.bytes_burst_capacity.is_none());
+    }
+
+    #[test]
+    fn iops_zero_serde_roundtrip() {
+        // Build with iops(0) → throttle.iops is None. Serialize +
+        // deserialize the config and confirm the field stays None.
+        // Pins the NonZeroU64 type-level invariant against a future
+        // serde-derive regression that might silently re-introduce
+        // a Some(0) representation (impossible by construction
+        // today, but a wrong-typed `Option<u64>` migration would
+        // bring it back).
+        let original = DiskConfig::default().iops(0).bytes_per_sec(0);
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: DiskConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.throttle.iops.is_none());
+        assert!(parsed.throttle.bytes_per_sec.is_none());
+        // Round-trip equality works because of the PartialEq derive
+        // on DiskConfig.
+        assert_eq!(parsed, original);
+    }
+
+    /// Full serde roundtrip with every field set to a non-default
+    /// value. Pin field-by-field equality after a JSON round trip so
+    /// a future `#[serde(rename = ...)]` or `#[serde(skip)]`
+    /// regression — the typical drift mode for serde-derived structs
+    /// — surfaces here loudly.
+    #[test]
+    fn disk_config_full_serde_roundtrip() {
+        let original = DiskConfig {
+            capacity_mib: 256,
+            filesystem: Filesystem::Raw,
+            throttle: DiskThrottle {
+                iops: NonZeroU64::new(2_500),
+                bytes_per_sec: NonZeroU64::new(50 * 1024 * 1024),
+                iops_burst_capacity: NonZeroU64::new(10_000),
+                bytes_burst_capacity: NonZeroU64::new(200 * 1024 * 1024),
+            },
+            read_only: true,
+            name: Some("data-disk"),
+            no_auto_mount: false,
+        };
+
+        let json = serde_json::to_string(&original).expect("serialize DiskConfig");
+        let parsed: DiskConfig = serde_json::from_str(&json).expect("deserialize DiskConfig");
+
+        // Wire-format canonicality — the serialized key must be
+        // `capacity_mib`, not the pre-rename `capacity_mb` (legacy)
+        // form. Catches a future `#[serde(rename = "capacity_mb")]`
+        // regression that flips the emitted key.
+        assert!(
+            json.contains("\"capacity_mib\""),
+            "JSON must use the canonical `capacity_mib` key: {json}"
+        );
+        assert!(
+            !json.contains("\"capacity_mb\""),
+            "JSON must NOT contain the pre-rename `capacity_mb` key: {json}"
+        );
+
+        // Deserialize-side break: a JSON with the legacy `capacity_mb`
+        // key must FAIL to parse. Catches `#[serde(alias = "capacity_mb")]`
+        // which is deserialize-only sugar — it leaves the serialized
+        // key alone (so the contains-checks above pass) but silently
+        // accepts the old name on read. Constructed by replacing the
+        // canonical key in the just-serialized JSON, keeping every
+        // other field/value identical so the legacy_json is well-formed
+        // in every respect except the one renamed key.
+        let legacy_json = json.replace("\"capacity_mib\"", "\"capacity_mb\"");
+        assert!(
+            serde_json::from_str::<DiskConfig>(&legacy_json).is_err(),
+            "deserialization must reject the pre-rename `capacity_mb` key \
+             — a regression that added `#[serde(alias = \"capacity_mb\")]` \
+             would silently accept old sidecars on read: legacy_json={legacy_json}"
+        );
+
+        // Whole-struct equality first — catches any field drift.
+        // `name` is stripped because it's `#[serde(skip)]` (see the
+        // dedicated assert at the bottom of this fn) and always
+        // round-trips to `None` regardless of original.
+        let original_for_eq = DiskConfig {
+            name: None,
+            ..original.clone()
+        };
+        assert_eq!(parsed, original_for_eq);
+        // Field-by-field follow-up — each line catches a distinct
+        // drift mode on its own (rename, skip, type-narrowing).
+        assert_eq!(parsed.capacity_mib, original.capacity_mib);
+        assert_eq!(parsed.filesystem, original.filesystem);
+        assert_eq!(parsed.throttle.iops, original.throttle.iops);
+        assert_eq!(
+            parsed.throttle.bytes_per_sec,
+            original.throttle.bytes_per_sec
+        );
+        assert_eq!(
+            parsed.throttle.iops_burst_capacity,
+            original.throttle.iops_burst_capacity
+        );
+        assert_eq!(
+            parsed.throttle.bytes_burst_capacity,
+            original.throttle.bytes_burst_capacity
+        );
+        assert_eq!(parsed.read_only, original.read_only);
+        // `name` is `#[serde(skip)]` since `&'static str` can't be
+        // deserialized from arbitrary input — the field round-trips
+        // to `None` regardless of original. Test authors that need
+        // disk identity in serialized output should use the disk's
+        // index instead. Pin this contract here so a future serde
+        // tweak (e.g. dropping the skip) surfaces in this assertion.
+        assert!(
+            parsed.name.is_none(),
+            "DiskConfig.name uses #[serde(skip)]; round-trip must produce None regardless of original (was {:?})",
+            original.name,
+        );
+    }
+
+    /// Roundtrip the unthrottled default (both throttle fields
+    /// `None`). Distinct from `iops_zero_serde_roundtrip` (which
+    /// builds via `.iops(0)/.bytes_per_sec(0)`): this exercises the
+    /// pure `DiskConfig::default()` shape, ensuring the `None`/`None`
+    /// throttle survives serialize→JSON→deserialize and that the
+    /// whole-struct PartialEq holds across the round trip.
+    #[test]
+    fn disk_config_default_unthrottled_serde_roundtrip() {
+        let original = DiskConfig::default();
+        assert!(original.throttle.iops.is_none());
+        assert!(original.throttle.bytes_per_sec.is_none());
+        assert!(original.name.is_none());
+
+        let json = serde_json::to_string(&original).expect("serialize default DiskConfig");
+        let parsed: DiskConfig =
+            serde_json::from_str(&json).expect("deserialize default DiskConfig");
+
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.capacity_mib, original.capacity_mib);
+        assert_eq!(parsed.filesystem, original.filesystem);
+        assert!(parsed.throttle.iops.is_none());
+        assert!(parsed.throttle.bytes_per_sec.is_none());
+        assert!(parsed.throttle.iops_burst_capacity.is_none());
+        assert!(parsed.throttle.bytes_burst_capacity.is_none());
+        assert_eq!(parsed.read_only, original.read_only);
+        assert!(parsed.name.is_none());
+    }
+
+    #[test]
+    fn with_name_builder_sets_label() {
+        let d = DiskConfig::default().with_name("data-disk");
+        assert_eq!(d.name, Some("data-disk"));
+
+        // Last call wins — the builder overwrites.
+        let d = DiskConfig::default().with_name("first").with_name("second");
+        assert_eq!(d.name, Some("second"));
+    }
+
+    /// The `with_name` builder is `const fn`, so a `static DiskConfig`
+    /// can be constructed by chaining setters off the const DEFAULT.
+    /// This pins the const-construction property the #[ktstr_test]
+    /// macro's `disk = ...` arm depends on.
+    #[test]
+    fn with_name_works_in_const_context() {
+        const NAMED: DiskConfig = DiskConfig::DEFAULT.with_name("static-disk");
+        assert_eq!(NAMED.name, Some("static-disk"));
+        assert_eq!(NAMED.capacity_mib, 256);
+    }
+
+    #[test]
+    fn burst_capacity_builders_set_fields() {
+        let d = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(5_000)
+            .bytes_per_sec(10 * 1024 * 1024)
+            .bytes_burst_capacity(50 * 1024 * 1024);
+        assert_eq!(d.throttle.iops, NonZeroU64::new(1_000));
+        assert_eq!(d.throttle.iops_burst_capacity, NonZeroU64::new(5_000));
+        assert_eq!(d.throttle.bytes_per_sec, NonZeroU64::new(10 * 1024 * 1024));
+        assert_eq!(
+            d.throttle.bytes_burst_capacity,
+            NonZeroU64::new(50 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn burst_capacity_zero_becomes_none() {
+        // Mirrors the iops/bytes_per_sec ergonomics: 0 → None at the
+        // type boundary so callers can clear a previously-set burst
+        // override without dropping back to a fresh `DiskConfig`.
+        let d = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(5_000)
+            .iops_burst_capacity(0);
+        assert!(d.throttle.iops_burst_capacity.is_none());
+
+        let d = DiskConfig::default()
+            .bytes_per_sec(1_000)
+            .bytes_burst_capacity(5_000)
+            .bytes_burst_capacity(0);
+        assert!(d.throttle.bytes_burst_capacity.is_none());
+    }
+
+    #[test]
+    fn burst_capacity_default_is_none() {
+        let d = DiskConfig::default();
+        assert!(d.throttle.iops_burst_capacity.is_none());
+        assert!(d.throttle.bytes_burst_capacity.is_none());
+    }
+
+    /// Clearing the rate via `iops(0)` also clears the matching
+    /// `iops_burst_capacity`. A burst capacity without a refill
+    /// rate is invalid per [`DiskThrottle::validate`]; without
+    /// this auto-clear, a `.iops(1000).iops_burst_capacity(5000)
+    /// .iops(0)` chain would leave a stale burst that turns the
+    /// next `validate()` into a "burst without rate" error
+    /// instead of the user's intent (a fully-unthrottled bucket).
+    #[test]
+    fn clearing_iops_clears_iops_burst() {
+        let d = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(5_000)
+            .iops(0);
+        assert!(d.throttle.iops.is_none());
+        assert!(
+            d.throttle.iops_burst_capacity.is_none(),
+            "clearing iops must also clear iops_burst_capacity \
+             so validate() doesn't fail with a stale-burst error",
+        );
+        // bytes side untouched — per-dimension independence.
+        let d = DiskConfig::default()
+            .bytes_per_sec(2_000)
+            .bytes_burst_capacity(8_000)
+            .iops(0);
+        assert!(d.throttle.bytes_per_sec.is_some());
+        assert!(d.throttle.bytes_burst_capacity.is_some());
+    }
+
+    /// Clearing the rate via `bytes_per_sec(0)` also clears the
+    /// matching `bytes_burst_capacity`. Mirror of
+    /// `clearing_iops_clears_iops_burst`.
+    #[test]
+    fn clearing_bytes_per_sec_clears_bytes_burst() {
+        let d = DiskConfig::default()
+            .bytes_per_sec(2_000)
+            .bytes_burst_capacity(8_000)
+            .bytes_per_sec(0);
+        assert!(d.throttle.bytes_per_sec.is_none());
+        assert!(
+            d.throttle.bytes_burst_capacity.is_none(),
+            "clearing bytes_per_sec must also clear \
+             bytes_burst_capacity",
+        );
+        // iops side untouched.
+        let d = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(5_000)
+            .bytes_per_sec(0);
+        assert!(d.throttle.iops.is_some());
+        assert!(d.throttle.iops_burst_capacity.is_some());
+    }
+
+    /// After a `clear-rate`-then-validate chain, the result must
+    /// validate cleanly. Pins the integration: setting both rate
+    /// and burst, then clearing the rate, leaves the throttle in
+    /// a state that `validate()` accepts (no orphan-burst error).
+    #[test]
+    fn clearing_rate_leaves_throttle_validate_clean() {
+        let throttle = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(5_000)
+            .bytes_per_sec(2_000)
+            .bytes_burst_capacity(8_000)
+            .iops(0)
+            .bytes_per_sec(0)
+            .throttle;
+        assert!(throttle.iops.is_none());
+        assert!(throttle.bytes_per_sec.is_none());
+        assert!(throttle.iops_burst_capacity.is_none());
+        assert!(throttle.bytes_burst_capacity.is_none());
+        throttle
+            .validate()
+            .expect("post-clear throttle must validate clean");
+    }
+
+    #[test]
+    fn validate_accepts_burst_at_or_above_rate() {
+        // burst == rate (the historical 1-second-burst behaviour
+        // expressed explicitly).
+        DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(1_000)
+            .throttle
+            .validate()
+            .expect("burst == iops accepted");
+
+        // burst > rate (multi-second burst).
+        DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(5_000)
+            .bytes_per_sec(10 * 1024 * 1024)
+            .bytes_burst_capacity(50 * 1024 * 1024)
+            .throttle
+            .validate()
+            .expect("burst > rate accepted");
+
+        // No throttle set → trivially valid.
+        DiskConfig::default()
+            .throttle
+            .validate()
+            .expect("no throttle accepted");
+
+        // Rate set, burst unset → trivially valid (burst defaults to
+        // rate-equivalent at wire-up time).
+        DiskConfig::default()
+            .iops(1_000)
+            .bytes_per_sec(1_000_000)
+            .throttle
+            .validate()
+            .expect("rate without burst accepted");
+    }
+
+    #[test]
+    fn validate_rejects_burst_below_rate() {
+        let err = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(500)
+            .throttle
+            .validate()
+            .expect_err("burst < iops rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Iops,
+                burst: 500,
+                rate: 1_000,
+            },
+            "unexpected error variant",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("iops_burst_capacity") && msg.contains("must be >="),
+            "unexpected error message: {msg}",
+        );
+        assert!(
+            msg.contains("pass 0 to clear"),
+            "remediation hint missing: {msg}",
+        );
+
+        let err = DiskConfig::default()
+            .bytes_per_sec(10_000)
+            .bytes_burst_capacity(5_000)
+            .throttle
+            .validate()
+            .expect_err("burst < bytes_per_sec rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Bytes,
+                burst: 5_000,
+                rate: 10_000,
+            },
+            "unexpected error variant",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bytes_burst_capacity") && msg.contains("must be >="),
+            "unexpected error message: {msg}",
+        );
+        assert!(
+            msg.contains("pass 0 to clear"),
+            "remediation hint missing: {msg}",
+        );
+    }
+
+    /// Off-by-one boundary: `burst == rate - 1` must be rejected. Pins
+    /// the strict `<` vs `<=` direction of the validate predicate
+    /// against a future flip that would silently accept a steady-state
+    /// rate one below the configured value.
+    #[test]
+    fn validate_rejects_burst_one_below_rate() {
+        let err = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(999)
+            .throttle
+            .validate()
+            .expect_err("iops burst one below rate must be rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Iops,
+                burst: 999,
+                rate: 1_000,
+            },
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("iops_burst_capacity") && msg.contains("must be >="),
+            "unexpected error message: {msg}",
+        );
+
+        let err = DiskConfig::default()
+            .bytes_per_sec(1_000)
+            .bytes_burst_capacity(999)
+            .throttle
+            .validate()
+            .expect_err("bytes burst one below rate must be rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Bytes,
+                burst: 999,
+                rate: 1_000,
+            },
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bytes_burst_capacity") && msg.contains("must be >="),
+            "unexpected error message: {msg}",
+        );
+    }
+
+    /// Builder chain that sets a rate and burst then clears the rate
+    /// via `iops(0)` must validate clean — clearing the rate also
+    /// clears the matching burst (per the [`DiskConfig::iops`]
+    /// auto-clear contract), so the resulting throttle is fully
+    /// unthrottled and validate rejects nothing. Distinct from
+    /// `clearing_rate_leaves_throttle_validate_clean` (which clears
+    /// both rates simultaneously); this one isolates the iops-only
+    /// clear path so a regression in just one auto-clear branch
+    /// surfaces here.
+    #[test]
+    fn iops_clear_after_burst_set_validates_clean() {
+        DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(5_000)
+            .iops(0)
+            .throttle
+            .validate()
+            .expect("iops-cleared throttle must validate clean");
+    }
+
+    #[test]
+    fn validate_rejects_burst_without_rate() {
+        let err = DiskConfig::default()
+            .iops_burst_capacity(5_000)
+            .throttle
+            .validate()
+            .expect_err("burst without iops rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstWithoutRate {
+                dimension: ThrottleDimension::Iops,
+            },
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("iops_burst_capacity") && msg.contains("without iops"),
+            "unexpected error message: {msg}",
+        );
+        assert!(
+            msg.contains("pass 0 to clear"),
+            "remediation hint missing: {msg}",
+        );
+
+        let err = DiskConfig::default()
+            .bytes_burst_capacity(5_000)
+            .throttle
+            .validate()
+            .expect_err("burst without bytes_per_sec rejected");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstWithoutRate {
+                dimension: ThrottleDimension::Bytes,
+            },
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bytes_burst_capacity") && msg.contains("without bytes_per_sec"),
+            "unexpected error message: {msg}",
+        );
+        assert!(
+            msg.contains("pass 0 to clear"),
+            "remediation hint missing: {msg}",
+        );
+    }
+
+    /// `DiskThrottleValidationError::dimension()` exposes the
+    /// throttle dimension (iops/bytes) the failure applies to so
+    /// callers can route a programmatic recovery without parsing
+    /// the rendered message. Pin the accessor's mapping over both
+    /// variants × both dimensions so a future variant addition
+    /// that forgets to populate the dimension surfaces here.
+    #[test]
+    fn validation_error_dimension_accessor() {
+        let err = DiskThrottleValidationError::BurstBelowRate {
+            dimension: ThrottleDimension::Iops,
+            burst: 500,
+            rate: 1_000,
+        };
+        assert_eq!(err.dimension(), ThrottleDimension::Iops);
+
+        let err = DiskThrottleValidationError::BurstBelowRate {
+            dimension: ThrottleDimension::Bytes,
+            burst: 500,
+            rate: 1_000,
+        };
+        assert_eq!(err.dimension(), ThrottleDimension::Bytes);
+
+        let err = DiskThrottleValidationError::BurstWithoutRate {
+            dimension: ThrottleDimension::Iops,
+        };
+        assert_eq!(err.dimension(), ThrottleDimension::Iops);
+
+        let err = DiskThrottleValidationError::BurstWithoutRate {
+            dimension: ThrottleDimension::Bytes,
+        };
+        assert_eq!(err.dimension(), ThrottleDimension::Bytes);
+    }
+
+    /// `ThrottleDimension::burst_field()` and `rate_field()` return
+    /// the wire field names matching [`DiskThrottle`] / [`DiskConfig`]
+    /// builder method names so error consumers can echo the offending
+    /// field back to the user. Pin both directions so a rename of
+    /// either field on `DiskThrottle` without a matching update here
+    /// surfaces as a test failure rather than silently desync'd
+    /// error messages.
+    #[test]
+    fn throttle_dimension_field_names() {
+        assert_eq!(ThrottleDimension::Iops.burst_field(), "iops_burst_capacity");
+        assert_eq!(ThrottleDimension::Iops.rate_field(), "iops");
+        assert_eq!(
+            ThrottleDimension::Bytes.burst_field(),
+            "bytes_burst_capacity",
+        );
+        assert_eq!(ThrottleDimension::Bytes.rate_field(), "bytes_per_sec");
+    }
+
+    /// Pin downcast through anyhow: `DiskThrottle::validate` returns
+    /// `Result<(), DiskThrottleValidationError>`, but production
+    /// callers (e.g. [`crate::vmm::KtstrVmBuilder::build`]) wrap the
+    /// failure in `anyhow::Error`. Library consumers that need to
+    /// pattern-match on the failure variant must therefore
+    /// `downcast_ref::<DiskThrottleValidationError>()` through the
+    /// anyhow chain. Without this test, a future change to the
+    /// callsite that loses the typed error (e.g. converting the
+    /// inner error to `String` before bubbling, or replacing
+    /// `anyhow::Error::new(e)` with `anyhow!("...{e}...")`) would
+    /// silently break the typed-error contract for downstream
+    /// callers — only surfacing as a regression at the consumer
+    /// site, which doesn't exist in-tree yet.
+    ///
+    /// The chain wraps with `.context(...)` to mirror the production
+    /// shape at [`crate::vmm::KtstrVm::init_virtio_blk`] (in
+    /// `src/vmm/setup.rs`) so the downcast walks through the same
+    /// context layer real callers see.
+    #[test]
+    fn disk_throttle_validation_error_downcasts_through_anyhow() {
+        let typed = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(500)
+            .throttle
+            .validate()
+            .expect_err("burst < iops rejected");
+        // Wrap in anyhow exactly like the production callsite does
+        // (KtstrVm::init_virtio_blk in src/vmm/setup.rs:
+        // anyhow!(e).context("invalid disk throttle")).
+        let wrapped = anyhow::anyhow!(typed).context("invalid disk throttle");
+        // The typed variant must be reachable through the anyhow
+        // chain via downcast_ref. Walk every cause.
+        let recovered = wrapped
+            .chain()
+            .find_map(|c| c.downcast_ref::<DiskThrottleValidationError>())
+            .expect(
+                "DiskThrottleValidationError must remain downcastable through \
+                 the production anyhow wrap; lost typing means library \
+                 consumers cannot route programmatic recovery",
+            );
+        assert_eq!(
+            *recovered,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Iops,
+                burst: 500,
+                rate: 1_000,
+            },
+        );
+        // Sanity: the rendered chain still contains the operator-
+        // facing context so logs show "invalid disk throttle: ...".
+        let rendered = format!("{wrapped:#}");
+        assert!(
+            rendered.contains("invalid disk throttle"),
+            "anyhow context must survive the wrap: {rendered}",
+        );
+    }
+
+    /// `DiskThrottle::validate` checks the iops dimension first and
+    /// short-circuits on the first failure. When BOTH dimensions
+    /// hold violations, the iops failure is returned; the bytes
+    /// failure surfaces only on a subsequent re-validate after the
+    /// caller fixes the iops side. Pin this ordering so a refactor
+    /// that aggregates errors (e.g. returns the first non-violating
+    /// dimension's failure) or reverses the check order surfaces
+    /// here. The test sets both dimensions intentionally violating
+    /// and asserts the variant carries `ThrottleDimension::Iops` —
+    /// any other variant is wrong.
+    #[test]
+    fn validate_first_failure_wins_iops_before_bytes() {
+        let throttle = DiskConfig::default()
+            .iops(1_000)
+            .iops_burst_capacity(500) // iops violation: burst < rate
+            .bytes_per_sec(10_000)
+            .bytes_burst_capacity(5_000) // bytes violation: burst < rate
+            .throttle;
+        let err = throttle
+            .validate()
+            .expect_err("both-dimensions-bad must reject");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstBelowRate {
+                dimension: ThrottleDimension::Iops,
+                burst: 500,
+                rate: 1_000,
+            },
+            "iops violation must surface first; refactor that aggregates \
+             or reverses the check order would change this",
+        );
+        assert_eq!(err.dimension(), ThrottleDimension::Iops);
+
+        // Same shape with the BurstWithoutRate variant: setting
+        // burst capacities on both dimensions with neither rate set
+        // exercises the "missing rate" branch with both dimensions
+        // violating.
+        let throttle = DiskConfig::default()
+            .iops_burst_capacity(5_000)
+            .bytes_burst_capacity(8_000)
+            .throttle;
+        let err = throttle
+            .validate()
+            .expect_err("both-without-rate must reject");
+        assert_eq!(
+            err,
+            DiskThrottleValidationError::BurstWithoutRate {
+                dimension: ThrottleDimension::Iops,
+            },
+            "iops violation must surface first across both \
+             BurstBelowRate and BurstWithoutRate variants",
+        );
+    }
+
+    /// Dedicated serde roundtrip for the burst fields. Distinct from
+    /// the full-roundtrip test: that one constructs a `DiskThrottle`
+    /// literal, this one drives the builder so a future builder
+    /// regression that fails to populate the underlying fields would
+    /// surface here even if struct-literal construction stayed
+    /// correct.
+    #[test]
+    fn disk_config_burst_serde_roundtrip() {
+        let original = DiskConfig::default()
+            .iops(2_500)
+            .iops_burst_capacity(10_000)
+            .bytes_per_sec(50 * 1024 * 1024)
+            .bytes_burst_capacity(200 * 1024 * 1024);
+
+        let json = serde_json::to_string(&original).expect("serialize burst DiskConfig");
+        let parsed: DiskConfig = serde_json::from_str(&json).expect("deserialize burst DiskConfig");
+
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.throttle.iops, NonZeroU64::new(2_500));
+        assert_eq!(parsed.throttle.iops_burst_capacity, NonZeroU64::new(10_000));
+        assert_eq!(
+            parsed.throttle.bytes_per_sec,
+            NonZeroU64::new(50 * 1024 * 1024)
+        );
+        assert_eq!(
+            parsed.throttle.bytes_burst_capacity,
+            NonZeroU64::new(200 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn disk_throttle_validation_error_hash_consistent_with_eq() {
+        use std::collections::HashSet;
+        let e1 = DiskThrottleValidationError::BurstWithoutRate {
+            dimension: ThrottleDimension::Iops,
+        };
+        let e2 = DiskThrottleValidationError::BurstWithoutRate {
+            dimension: ThrottleDimension::Iops,
+        };
+        let mut set: HashSet<DiskThrottleValidationError> = HashSet::new();
+        set.insert(e1);
+        assert!(set.contains(&e2));
+    }
+}

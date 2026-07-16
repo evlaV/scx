@@ -1,0 +1,189 @@
+# VMM
+
+ktstr includes a purpose-built VMM (virtual machine monitor) that boots
+Linux kernels in KVM for testing.
+
+## KtstrVm builder
+
+```rust,ignore
+let result = vmm::KtstrVm::builder()
+    .kernel(&kernel_path)
+    .init_binary(&ktstr_binary)
+    .topology(Topology::new(numa_nodes, llcs, cores_per_llc, threads_per_core))
+    .memory_mib(4096)
+    .run_args(&["run".into(), "--ktstr-test-fn".into(), "my_test".into()])
+    .build()?
+    .run()?;
+```
+
+## Topology
+
+The VM topology is specified as `(numa_nodes, llcs, cores_per_llc,
+threads_per_core)`. On x86_64, the VMM creates ACPI tables (MADT,
+SRAT, SLIT, and HMAT when `numa_nodes > 1`) and MP tables. On
+aarch64, topology is expressed via FDT cpu nodes with MPIDR-derived
+`reg` properties.
+
+```rust,ignore
+pub struct Topology {
+    pub llcs: u32,
+    pub cores_per_llc: u32,
+    pub threads_per_core: u32,
+    pub numa_nodes: u32,
+    pub nodes: Option<&'static [NumaNode]>,
+    pub distances: Option<&'static NumaDistance>,
+}
+```
+
+`total_cpus()` = llcs * cores_per_llc * threads_per_core.
+`num_llcs()` = llcs.
+
+When `nodes` is `None` (the default), memory and LLCs are distributed
+uniformly across NUMA nodes with default 10/20 distances. When
+`Some`, each `NumaNode` specifies its LLC count, memory size, and
+optional HMAT attributes (`latency_ns`, `bandwidth_mbs`,
+`mem_side_cache`). A `NumaNode` with `llcs = 0` models a CXL
+memory-only node.
+
+`NumaDistance` is an NxN inter-node distance matrix. Diagonal entries
+must be 10 and off-diagonal > 10 (ACPI SLIT requirements); ktstr
+additionally requires the matrix to be symmetric.
+
+Use `Topology::new(numa_nodes, llcs, cores, threads)` for uniform
+topologies, or `Topology::with_nodes(cores, threads, &nodes)` for
+explicit per-node configuration.
+
+## initramfs
+
+The VMM builds a cpio initramfs containing:
+
+- The test binary (as `/init`)
+- Optional scheduler binary (as `/scheduler`)
+- Shared library dependencies (resolved via ELF DT_NEEDED parsing)
+
+The initramfs is split into a cached base plus a per-run suffix. The
+base cache key is derived from the payload's shared-library set (its
+ELF DT_NEEDED closure plus interpreter) and the content hashes of the
+packed scheduler/probe/worker binaries and include files — not the
+test binary's own bytes, which ride the per-run suffix. So a payload
+recompile that keeps the same library set is a base-cache hit. A
+compressed SHM segment enables COW overlay into guest memory, sharing
+physical pages across concurrent VMs.
+
+## Guest-host communication
+
+**Serial console** -- COM2 is the canonical crash-diagnostic
+transport. The guest panic hook writes
+`PANIC: <info>\n<bt>\n` to COM2; the host parses it via
+`extract_panic_message` and surfaces the backtrace in test failure
+output. (Ordinary guest stdout/stderr does NOT use COM2 — it
+travels over the virtio-console port-1 bulk stream as
+`MsgType::Stdout`/`Stderr` frames; see below.) The legacy COM2
+result / exit-code fallback (delimited
+`===KTSTR_TEST_RESULT_START===` / `_END===` sentinels and
+`KTSTR_EXIT=N` lines) was removed pre-1.0 — virtio-console port-1
+(below) is the only result transport.
+
+**Virtio-console port 1 TLV stream** -- the primary guest-to-host
+data channel. Carries scenario markers (`MSG_TYPE_SCENARIO_START`,
+`MSG_TYPE_SCENARIO_END`), test results (`MSG_TYPE_TEST_RESULT`),
+exit codes (`MSG_TYPE_EXIT`), stimulus events (`MSG_TYPE_STIMULUS`),
+scheduler exit notifications (`MSG_TYPE_SCHED_EXIT`), profraw
+coverage data (`MSG_TYPE_PROFRAW`), per-payload-invocation metrics
+(`MSG_TYPE_PAYLOAD_METRICS`), and raw LlmExtract output
+(`MSG_TYPE_RAW_PAYLOAD_OUTPUT`). Each TLV frame has a CRC32 for
+integrity checking.
+
+## Virtio devices
+
+The VMM implements three virtio-MMIO devices in addition to the
+serial console above. All three speak the virtio 1.x MMIO transport
+(virtio-v1.2 §4.2.2) with `VIRTIO_F_VERSION_1` and use irqfd
+(eventfd → KVM GSI) for interrupt delivery.
+
+- **virtio-blk** (`vmm::virtio_blk`) -- file-backed block device
+  with a single request virtqueue and a token-bucket throttle.
+  Used to give workloads real on-disk filesystems (per-test images
+  cloned from a btrfs template). Advertises
+  `VIRTIO_BLK_F_BLK_SIZE`, `VIRTIO_BLK_F_SEG_MAX`,
+  `VIRTIO_BLK_F_SIZE_MAX`, `VIRTIO_BLK_F_FLUSH`, and
+  `VIRTIO_RING_F_EVENT_IDX`, plus `VIRTIO_BLK_F_RO` when configured
+  read-only.
+- **virtio-net** (`vmm::virtio_net`) -- two-virtqueue (RX, TX) NIC
+  with an in-VMM L2 loopback backend. Used by network-shaped
+  workloads (TCP/UDP throughput, latency) without depending on the
+  host's network stack. Advertises `VIRTIO_NET_F_MAC` so the guest
+  binds a deterministic MAC.
+- **virtio-console** (`vmm::virtio_console`) -- three-port multiport
+  console with eight virtqueues (per virtio-v1.2 §5.3.5: two control
+  queues plus an in/out pair per port, three ports → 2 + 2·3 = 8).
+  Port 0 carries the interactive `/dev/hvc0` console alongside the
+  COM1/COM2 16550 serial ports; port 1 carries the guest-to-host TLV
+  stream that delivers exit code, test result, per-payload metrics,
+  raw payload outputs, profraw, and scheduler exit notifications;
+  port 2 is a transparent byte-pipe relay carrying scx_stats request
+  bytes from the host to the in-guest relay thread and the
+  scheduler's responses back. Advertises
+  `VIRTIO_CONSOLE_F_MULTIPORT` with `max_nr_ports = 3`.
+
+## Performance mode
+
+When `performance_mode` is enabled, the VMM applies host-side
+isolation (vCPU pinning, hugepages, NUMA mbind, RT scheduling),
+guest-visible hints (KVM_HINTS_REALTIME CPUID), and KVM exit
+suppression. Non-performance-mode VMs set `KVM_CAP_HALT_POLL` to
+200us; overcommitted topologies set it to 0.
+
+See [Performance Mode](../concepts/performance-mode.md) for the
+full optimization list, prerequisites, and validation.
+
+## Dual-role architecture
+
+The same test binary serves two roles:
+
+**Host side** -- manages the VM lifecycle: builds the initramfs, boots
+the kernel, runs the monitor, and evaluates results.
+
+**Guest side** -- runs inside the VM as `/init` (PID 1). The Rust init
+code (`vmm::rust_init`) mounts filesystems, starts the scheduler,
+dispatches the test function, then reboots.
+
+The role is determined at runtime:
+
+- **PID 1 detection**: when running as PID 1, the `#[ctor]` function
+  `ktstr_test_early_dispatch()` runs the guest init path, which handles
+  the full guest lifecycle.
+- **`#[ktstr_test]` host dispatch**: a `#[ctor::ctor]` function
+  (`ktstr_test_early_dispatch`) runs before `main()` in any binary
+  that links against ktstr. When both `--ktstr-test-fn` and `--ktstr-topo`
+  are present, it boots a VM and runs the test inside it.
+- **`#[ktstr_test]` guest dispatch**: when only `--ktstr-test-fn` is
+  present (no `--ktstr-topo`), the ctor runs the test function
+  directly -- the binary is already inside a VM.
+
+This design means one `cargo build` produces everything needed for
+both host and guest execution. The initramfs embeds the same binary
+that built it.
+
+## Boot process
+
+1. Load kernel (bzImage on x86_64, Image on aarch64) via `linux-loader`.
+2. Set up KVM vCPUs with the specified topology. vCPU creation
+   takes `kvm->lock` twice in the kernel (`kvm_vm_ioctl_create_vcpu`
+   in `virt/kvm/kvm_main.c`): once for the
+   `created_vcpus` counter + per-arch precreate hook, then released
+   before the per-vCPU allocations, and reacquired for vcpu-list
+   insertion. The largest cost — the per-vCPU FPU `vzalloc` on
+   x86_64 (`fpu_alloc_guest_fpstate` at
+   `arch/x86/kernel/fpu/core.c:242`) — runs between the two lock
+   acquisitions and can parallelize across vCPUs (aarch64 has its
+   own per-vCPU init path with analogous costs). High vCPU counts
+   still add measurable boot latency even with the concurrency,
+   because each vCPU pays the alloc + TSC-sync cost serially within
+   its own thread. See [Performance Mode](../concepts/performance-mode.md).
+3. Build and load initramfs.
+4. Set up serial devices (COM1 for kernel console, COM2 for crash diagnostics).
+5. Boot the kernel.
+6. Kernel starts `/init` (the test binary).
+7. PID 1 detected: the guest init path mounts filesystems, starts the
+   scheduler, dispatches the test function, and reboots.

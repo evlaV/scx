@@ -1,0 +1,5 @@
+error: declare_scheduler!: const name `EEVDF` is reserved for the built-in Scheduler::EEVDF baseline; pick a different identifier
+ --> tests/compile_fail/declare_scheduler_reserved_eevdf.rs:3:20
+  |
+3 | declare_scheduler!(EEVDF, {
+  |                    ^^^^^

@@ -1,0 +1,5 @@
+error: expected path for scheduler (e.g. MITOSIS or crate::MITOSIS)
+ --> tests/compile_fail/ktstr_test_scheduler_not_path.rs:3:26
+  |
+3 | #[ktstr_test(scheduler = 42)]
+  |                          ^^
