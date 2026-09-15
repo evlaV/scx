@@ -1,0 +1,7 @@
+error: numa_nodes must be > 0 (a topology with zero NUMA nodes has nothing to attach LLCs or memory to; every downstream accessor would observe an empty node set)
+ --> tests/compile_fail/ktstr_test_numa_nodes_zero.rs:3:1
+  |
+3 | #[ktstr_test(numa_nodes = 0)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

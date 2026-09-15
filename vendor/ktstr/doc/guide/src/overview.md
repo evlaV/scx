@@ -1,0 +1,132 @@
+# ktstr
+
+ktstr is a test harness for Linux process schedulers, with a focus on
+sched_ext (BPF-extensible process scheduling). It boots Linux kernels
+in KVM virtual machines with
+controlled CPU topologies, runs workloads, and verifies scheduling
+correctness. Also tests under the kernel's default EEVDF scheduler.
+
+## Quick taste
+
+The simplest test calls a canned scenario:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
+    scenarios::steady(ctx)
+}
+```
+
+```sh
+cargo ktstr test --kernel ../linux
+```
+
+Without a `scheduler` attribute, tests run under EEVDF. See
+[Getting Started](getting-started.md) for testing a sched_ext scheduler.
+
+## Library API
+
+The `ktstr::prelude` module re-exports the types needed for writing
+tests. Declare cgroups and workloads as data with `CgroupDef`:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("cg_0").workers(2),
+        CgroupDef::named("cg_1").workers(2),
+    ])
+}
+```
+
+The prelude also exports low-level types (`CgroupGroup`,
+`WorkloadConfig`, `WorkloadHandle`) for manual cgroup and worker
+management, `Assert` for composable assertion config, and
+`WorkerReport` for telemetry access.
+
+For binary workloads (running `schbench`, `fio`, or any external
+executable as part of a test), see
+[Payload Definitions](writing-tests/scheduler-definitions.md#derive-payload).
+`#[ktstr_test(payload = FIXTURE)]` runs a `Payload` (binary
+workload) alongside the cgroup workers; the `scheduler =` slot
+takes a bare `Scheduler` reference — the const emitted by
+`declare_scheduler!`.
+
+## What it tests
+
+- **Fair scheduling** -- workers get CPU time without starvation or
+  excessive scheduling gaps.
+- **Cpuset isolation** -- workers stay on assigned CPUs.
+- **Dynamic operations** -- cgroups created, destroyed, and resized
+  mid-run.
+- **Affinity** -- scheduler respects thread affinity constraints.
+- **Stress** -- many cgroups, many workers, rapid topology changes.
+- **Stall detection** -- scheduler doesn't drop tasks.
+
+## Design
+
+Two principles drive ktstr's architecture:
+
+**Fidelity without overhead** -- every test boots a real Linux kernel
+in a KVM VM with real cgroups and real BPF programs. No mocking, no
+containers, no shared state. The VMM is minimal and PCI-free: two
+16550 serial ports (COM1 for kernel console, COM2 for crash
+diagnostics) and three virtio-MMIO devices (virtio-console for the
+host↔guest TLV stream on port-1 — used for scenario dispatch and
+result envelopes — plus virtio-blk for file-backed block storage
+with optional btrfs templates and virtio-net for in-VMM L2 loopback
+used by network workload tests).
+
+**Direct access over tooling layers** -- the host-side monitor reads
+guest memory directly via BTF (BPF Type Format)-resolved struct
+offsets to observe scheduler state. The monitor runs entirely
+host-side — no BPF programs are injected into the guest to collect
+scheduler telemetry, so observations do not perturb scheduling
+decisions. (BPF programs loaded by the scheduler under test, the
+BPF verifier pipeline, and the auto-repro probe pipeline are
+separate concerns; those are the code under test, not the
+observation layer.) See [Monitor](architecture/monitor.md) for
+details on BTF resolution and guest memory introspection.
+
+## BPF verifier analysis
+
+The `verifier_pipeline` tests boot a scheduler in a VM and capture
+per-program verifier output from the real kernel verifier. The
+default output applies **cycle collapse** to reduce repetitive loop
+unrolling. See [BPF Verifier](running-tests/verifier.md) for details.
+
+## Auto-repro probe pipeline
+
+When a scheduler crashes, ktstr can automatically rerun the failing
+scenario with BPF probes attached to the crash-path functions. See
+[Auto-Repro](running-tests/auto-repro.md) for details.
+
+## Workspace structure
+
+| Component | Purpose |
+|---|---|
+| `ktstr` (lib) | Core library |
+| `ktstr-macros` | `#[ktstr_test]`, `declare_scheduler!`, and `#[derive(Payload)]` proc macros |
+| `ktstr` (bin) | Host-side CLI |
+| `cargo-ktstr` (bin) | Cargo-integrated workflow: test, coverage, llvm-cov, kernel mgmt, verifier analysis, stats, interactive shell |
+| `scx-ktstr` | Minimal BPF scheduler for testing |
+
+`ktstr` and `cargo-ktstr` are the two user-facing `[[bin]]`
+targets in the crate; install them with
+`cargo install --locked ktstr`.
+The crate also defines two test-fixture `[[bin]]` targets —
+`ktstr-jemalloc-probe` and `ktstr-jemalloc-alloc-worker` —
+used by the `tests/jemalloc_probe_tests.rs` integration tests.
+They require the non-default `integration` feature, so a default
+`cargo install` builds only the two user-facing binaries and never
+places the fixtures on `$PATH`.
+
+## Kernel config
+
+`ktstr.kconfig` in the repo root contains the kernel config fragment
+needed for scheduler testing (sched_ext, BPF, kprobes, cgroups).
+Copy it to your kernel source tree and run `make olddefconfig`.

@@ -1,0 +1,523 @@
+use std::{
+    cmp,
+    collections::HashMap,
+    ffi::CStr,
+    io::{BufRead, Cursor, Seek, SeekFrom},
+    mem,
+    sync::Arc,
+};
+
+use memmap2::Mmap;
+
+use crate::{btf::*, cbtf, Error, Result};
+
+// Main internal representation of a parsed BTF section.
+pub struct BtfSection(Box<dyn BtfBackend + Send + Sync>);
+
+impl BtfSection {
+    // Parse a BTF section from a mmaped file. This takes the `Mmap` ownership
+    // to allow reading the BTF data on-demand. This provides a faster
+    // initialization and a lower memory footprint than `Self::from_reader`.
+    pub(super) fn from_mmap(mmap: Mmap, base: Option<Arc<BtfSection>>) -> Result<Self> {
+        Ok(Self(Box::new(MmapBtfSection::new(mmap, base)?)))
+    }
+
+    // Parse a BTF section from a Reader. The BTF data is cached in memory. This
+    // provides faster API access than `Self::from_mmap`.
+    pub(super) fn from_reader<R: Seek + BufRead>(
+        reader: &mut R,
+        base: Option<Arc<BtfSection>>,
+    ) -> Result<Self> {
+        Ok(Self(Box::new(CachedBtfSection::new(reader, base)?)))
+    }
+
+    /// Find a list of BTF ids with a given name.
+    ///
+    /// Using an empty name (`""`) resolves anonymous ids.
+    pub fn resolve_ids_by_name(&self, name: &str) -> Result<Vec<u32>> {
+        self.0.resolve_ids_by_name(name)
+    }
+
+    /// Find a list of BTF ids whose names match a regex.
+    ///
+    /// If the regex matches the empty name (`""`), e.g. `"^$"`, the result will
+    /// contain anonymous ids.
+    #[cfg(feature = "regex")]
+    pub fn resolve_ids_by_regex(&self, re: &regex::Regex) -> Result<Vec<u32>> {
+        self.0.resolve_ids_by_regex(re)
+    }
+
+    /// Find a BTF type with a given id.
+    pub fn resolve_type_by_id(&self, id: u32) -> Result<Type> {
+        self.0.resolve_type_by_id(id)
+    }
+
+    /// Find a list of BTF types with a given name.
+    ///
+    /// Using an empty name (`""`) resolves anonymous types.
+    pub fn resolve_types_by_name(&self, name: &str) -> Result<Vec<Type>> {
+        let mut types = Vec::new();
+        self.resolve_ids_by_name(name)?
+            .iter()
+            .try_for_each(|id| -> Result<()> {
+                types.push(self.resolve_type_by_id(*id)?);
+                Ok(())
+            })?;
+        Ok(types)
+    }
+
+    /// Find a list of BTF types whose names match a regex.
+    ///
+    /// If the regex matches the empty name (`""`), e.g. `"^$"`, the result will
+    /// contain anonymous types.
+    #[cfg(feature = "regex")]
+    pub fn resolve_types_by_regex(&self, re: &regex::Regex) -> Result<Vec<Type>> {
+        let mut types = Vec::new();
+        self.resolve_ids_by_regex(re)?
+            .iter()
+            .try_for_each(|id| -> Result<()> {
+                types.push(self.resolve_type_by_id(*id)?);
+                Ok(())
+            })?;
+        Ok(types)
+    }
+
+    /// Return the range of the type ids contained in this section in the
+    /// (start, end) form ("start" and "end" ids are included).
+    pub fn type_id_range(&self) -> (u32, u32) {
+        let start = self.0.type_id_offset();
+        let end = start + self.0.types() as u32 - 1;
+        (start, end)
+    }
+
+    /// Return an iterator over all types defined in the current BTF section.
+    pub fn type_iter(&self) -> TypeIter<'_> {
+        TypeIter::new(self, None)
+    }
+
+    // Resolve a name referenced by a Type which is defined in the current BTF
+    // section.
+    pub(super) fn resolve_name(&self, r#type: &dyn BtfType) -> Result<String> {
+        let offset = r#type
+            .get_name_offset()
+            .ok_or(Error::OpNotSupp("No name offset in type".to_string()))?;
+        self.resolve_name_by_offset(offset)
+            .ok_or(Error::InvalidString(offset))
+    }
+
+    fn header(&self) -> &cbtf::btf_header {
+        self.0.header()
+    }
+
+    // Return the number of types in the section.
+    fn types(&self) -> usize {
+        self.0.types()
+    }
+
+    // Resolve a name using its offset.
+    fn resolve_name_by_offset(&self, offset: u32) -> Option<String> {
+        self.0.resolve_name_by_offset(offset)
+    }
+}
+
+// Helpers implemented by BTF backends to allow querying the BTF definitions
+// (types, names, etc).
+pub(super) trait BtfBackend {
+    // Access the BTF header as a reference.
+    fn header(&self) -> &cbtf::btf_header;
+    // Return the type id offset.
+    fn type_id_offset(&self) -> u32;
+    // Return the number of types in the section.
+    fn types(&self) -> usize;
+    // Find a list of BTF ids with a given name.
+    fn resolve_ids_by_name(&self, name: &str) -> Result<Vec<u32>>;
+    // Find a BTF type with a given id.
+    fn resolve_type_by_id(&self, id: u32) -> Result<Type>;
+    // Resolve a name using its offset.
+    fn resolve_name_by_offset(&self, offset: u32) -> Option<String>;
+    // Find a list of BTF ids whose names match a regex.
+    #[cfg(feature = "regex")]
+    fn resolve_ids_by_regex(&self, re: &regex::Regex) -> Result<Vec<u32>>;
+}
+
+// Backend for a parsed BTF section with all its types and strings cached in
+// memory. This provides faster API performances at the cost of slower
+// initialization and increase in memory footprint.
+struct CachedBtfSection {
+    header: cbtf::btf_header,
+    // Type id offset from the base, 0 if not.
+    type_offset: u32,
+    // Map from str offsets to the strings. For internal use (name resolution)
+    // only.
+    str_cache: HashMap<u32, String>,
+    // Map from symbol names to their type id, used for retrieving a type by its
+    // name.
+    strings: HashMap<String, Vec<u32>>,
+    // Vector of all the types parsed from the BTF info. The vector makes the
+    // retrieval by their id implicit as the id is incremental in the BTF file;
+    // but that is really the goal here.
+    types: Vec<Type>,
+}
+
+impl CachedBtfSection {
+    fn new<R: Seek + BufRead>(reader: &mut R, base: Option<Arc<BtfSection>>) -> Result<Self> {
+        // First parse the BTF header, retrieve the endianness & perform sanity
+        // checks.
+        let (header, endianness) = cbtf::btf_header::from_reader(reader)?;
+        if header.version != 1 {
+            return Err(Error::Format(format!(
+                "Unsupported BTF version: {}",
+                header.version
+            )));
+        }
+        if header.flags != 0 {
+            return Err(Error::Format(format!(
+                "Unsupported flags {:#x}",
+                header.flags
+            )));
+        }
+        let (est_str, est_ty) = estimate(&header);
+
+        // Cache the str section for later use (name resolution).
+        let offset = u64::checked_add(header.hdr_len as u64, header.str_off as u64)
+            .ok_or(Error::Format("Invalid strings section offset".to_string()))?;
+        reader.seek(SeekFrom::Start(offset))?;
+
+        let mut str_cache = HashMap::with_capacity(est_str);
+        let mut offset: u32 = 0;
+
+        // For split BTFs both ids and string offsets are logically consecutive.
+        let (mut id, start_str_off) = match base {
+            None => (1, 0),
+            Some(ref base) => (base.types() as u32, base.header().str_len),
+        };
+
+        while offset < header.str_len {
+            let mut raw = Vec::new();
+            let bytes = reader.read_until(b'\0', &mut raw)? as u32;
+
+            let s = bytes_to_str(&raw)?;
+            str_cache.insert(start_str_off + offset, String::from(s));
+
+            offset += bytes;
+        }
+
+        // Finally build our representation of the BTF types.
+        let offset = u64::checked_add(header.hdr_len as u64, header.type_off as u64)
+            .ok_or(Error::Format("Invalid types section offset".to_string()))?;
+        reader.seek(SeekFrom::Start(offset))?;
+
+        let mut strings: HashMap<String, Vec<u32>> = HashMap::with_capacity(est_str);
+        let mut types = Vec::with_capacity(est_ty);
+
+        if base.is_none() {
+            // Add special type Void with ID 0 (not described in type section)
+            // only on base BTF.
+            types.push(Type::Void);
+        }
+
+        let end_type_section = u64::checked_add(offset, header.type_len as u64)
+            .ok_or(Error::Format("Invalid types section length".to_string()))?;
+        while reader.stream_position()? < end_type_section {
+            let bt = cbtf::btf_type::from_reader(reader, &endianness)?;
+            let r#type = Type::from_reader(reader, &endianness, bt)?;
+
+            if let Some(name_off) = bt.name_offset() {
+                // Look for the name in our own cache, and if not found try
+                // looking into the base one (if any).
+                let name = str_cache.get(&name_off).cloned().or_else(|| {
+                    base.as_ref()
+                        .and_then(|base| base.resolve_name_by_offset(name_off))
+                });
+
+                match name {
+                    Some(ref name) => match strings.get_mut(name) {
+                        Some(entry) => entry.push(id),
+                        None => _ = strings.insert(name.clone(), vec![id]),
+                    },
+                    None => return Err(Error::InvalidString(name_off)),
+                }
+            }
+
+            types.push(r#type);
+            id += 1;
+        }
+
+        // Sanity check
+        if reader.stream_position()? != end_type_section {
+            return Err(Error::Format("Invalid type section".to_string()));
+        }
+
+        Ok(Self {
+            header,
+            type_offset: match base {
+                Some(base) => base.types() as u32,
+                None => 0,
+            },
+            str_cache,
+            strings,
+            types,
+        })
+    }
+}
+
+impl BtfBackend for CachedBtfSection {
+    fn header(&self) -> &cbtf::btf_header {
+        &self.header
+    }
+
+    fn type_id_offset(&self) -> u32 {
+        self.type_offset
+    }
+
+    fn types(&self) -> usize {
+        self.types.len()
+    }
+
+    fn resolve_ids_by_name(&self, name: &str) -> Result<Vec<u32>> {
+        Ok(self.strings.get(name).cloned().unwrap_or_default())
+    }
+
+    fn resolve_type_by_id(&self, id: u32) -> Result<Type> {
+        let local_id = match id.checked_sub(self.type_offset) {
+            Some(id) if (id as usize) < self.types() => id,
+            _ => return Err(Error::InvalidType(id)),
+        };
+
+        self.types
+            .get(local_id as usize)
+            .cloned()
+            .ok_or(Error::InvalidType(id))
+    }
+
+    fn resolve_name_by_offset(&self, offset: u32) -> Option<String> {
+        self.str_cache.get(&offset).cloned()
+    }
+
+    #[cfg(feature = "regex")]
+    fn resolve_ids_by_regex(&self, re: &regex::Regex) -> Result<Vec<u32>> {
+        Ok(self
+            .strings
+            .iter()
+            .filter_map(|(name, ids)| match re.is_match(name) {
+                true => Some(ids.clone()),
+                false => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>())
+    }
+}
+
+// Backend for a parsed BTF section keeping the input data memory-mapped. This
+// provides a faster initialization and lower memory footprint at the cost of
+// slower API performances.
+struct MmapBtfSection {
+    endianness: cbtf::Endianness,
+    header: cbtf::btf_header,
+    // String offset from the base, 0 if not.
+    str_offset: u32,
+    // Type id offset from the base, 0 if not.
+    type_offset: u32,
+    // Number of types defined in the section.
+    types: usize,
+    // Memory-mapped reader.
+    mmap: Mmap,
+    // Map from type ids to their offsets in the mmaped BTF.
+    type_offsets: Vec<usize>,
+}
+
+impl MmapBtfSection {
+    fn new(mmap: Mmap, base: Option<Arc<BtfSection>>) -> Result<Self> {
+        let len = mmap.len();
+        let mut reader = Cursor::new(mmap);
+
+        // First parse the BTF header, retrieve the endianness & perform sanity
+        // checks.
+        let (header, endianness) = cbtf::btf_header::from_reader(&mut reader)?;
+        if header.version != 1 {
+            return Err(Error::Format(format!(
+                "Unsupported BTF version: {}",
+                header.version
+            )));
+        }
+        if header.flags != 0 {
+            return Err(Error::Format(format!(
+                "Unsupported flags {:#x}",
+                header.flags
+            )));
+        }
+        let (_, est_ty) = estimate(&header);
+
+        // Then sanity check the string section.
+        let offset = u64::checked_add(header.hdr_len as u64, header.str_off as u64)
+            .ok_or(Error::Format("Invalid strings section offset".to_string()))?;
+        let offset = u64::checked_add(offset, header.str_len as u64)
+            .ok_or(Error::Format("Invalid strings section length".to_string()))?;
+        if len < offset as usize {
+            return Err(Error::Format(
+                "String section is missing or incomplete".to_string(),
+            ));
+        }
+
+        // Finally build our representation of the BTF types.
+        let offset = u64::checked_add(header.hdr_len as u64, header.type_off as u64)
+            .ok_or(Error::Format("Invalid types section offset".to_string()))?;
+        reader.seek(SeekFrom::Start(offset))?;
+
+        let mut offsets = Vec::with_capacity(est_ty);
+        let mut types = 0;
+
+        let end_type_section = u64::checked_add(offset, header.type_len as u64)
+            .ok_or(Error::Format("Invalid types section length".to_string()))?;
+        while reader.stream_position()? < end_type_section {
+            offsets.push(reader.stream_position()? as usize);
+            cbtf::btf_skip_type(&mut reader, &endianness)?;
+            types += 1;
+        }
+
+        // Sanity check
+        if reader.stream_position()? != end_type_section {
+            return Err(Error::Format("Invalid type section".to_string()));
+        }
+
+        let (str_offset, type_offset) = match base {
+            Some(base) => (base.header().str_len, base.types() as u32),
+            None => (0, 0),
+        };
+
+        Ok(Self {
+            endianness,
+            header,
+            str_offset,
+            type_offset,
+            types,
+            mmap: reader.into_inner(),
+            type_offsets: offsets,
+        })
+    }
+
+    // Iterate over the type names, calling a function on them (providing the
+    // type id and name bytes buffer).
+    fn iter_over_names<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(u32, &[u8]) -> Result<()>,
+    {
+        let mmap = &self.mmap;
+
+        for (id, offset) in self.type_offsets.iter().enumerate() {
+            let bt = cbtf::btf_type::from_bytes(&mmap[*offset..], &self.endianness)?;
+            let name_off = match bt.name_offset() {
+                Some(offset) => offset,
+                None => continue,
+            };
+
+            if name_off < self.header.str_len {
+                let start = (self.header.hdr_len + self.header.str_off + name_off) as usize;
+
+                f(id as u32 + 1 + self.type_offset, &mmap[start..])?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl BtfBackend for MmapBtfSection {
+    fn header(&self) -> &cbtf::btf_header {
+        &self.header
+    }
+
+    fn type_id_offset(&self) -> u32 {
+        self.type_offset
+    }
+
+    fn types(&self) -> usize {
+        // Take `Type::Void` into account for base sections.
+        (if self.type_offset != 0 { 0 } else { 1 }) + self.types
+    }
+
+    fn resolve_ids_by_name(&self, name: &str) -> Result<Vec<u32>> {
+        let len = name.len();
+        let mut ids = Vec::new();
+
+        self.iter_over_names(|id, buf| {
+            // If len == buf.len(), the NULL char isn't there.
+            if len < buf.len() && buf[len] == b'\0' && name.as_bytes() == &buf[..len] {
+                ids.push(id);
+            }
+            Ok(())
+        })?;
+
+        Ok(ids)
+    }
+
+    fn resolve_type_by_id(&self, id: u32) -> Result<Type> {
+        let local_id = match id.checked_sub(self.type_offset) {
+            Some(id) if (id as usize) < self.types() => id,
+            _ => return Err(Error::InvalidType(id)),
+        };
+
+        if id == 0 {
+            return Ok(Type::Void);
+        }
+
+        Ok(match self.type_offsets.get(local_id as usize - 1) {
+            Some(offset) => {
+                let bt = cbtf::btf_type::from_bytes(&self.mmap[*offset..], &self.endianness)?;
+                Type::from_bytes(
+                    &self.mmap[(*offset + mem::size_of::<cbtf::btf_type>())..],
+                    &self.endianness,
+                    bt,
+                )?
+            }
+            None => return Err(Error::InvalidType(id)),
+        })
+    }
+
+    fn resolve_name_by_offset(&self, offset: u32) -> Option<String> {
+        let offset = match offset.checked_sub(self.str_offset) {
+            Some(id) if id <= self.header.str_len => id,
+            _ => return None,
+        };
+
+        let start = (self.header.hdr_len + self.header.str_off + offset) as usize;
+        bytes_to_str(&self.mmap[start..])
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    #[cfg(feature = "regex")]
+    fn resolve_ids_by_regex(&self, re: &regex::Regex) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        self.iter_over_names(|id, buf| {
+            if let Ok(s) = bytes_to_str(buf) {
+                if re.is_match(s) {
+                    ids.push(id);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+}
+
+// Estimate the number of strings and types defined in the BTF section.
+fn estimate(header: &cbtf::btf_header) -> (usize, usize) {
+    let mut strings = header.str_len as usize / 15;
+    let mut types = header.type_len as usize / 22;
+
+    // Cap at 16MB.
+    const MAX_SIZE: usize = 16 * 1024 * 1024;
+    strings = cmp::min(strings, MAX_SIZE / mem::size_of::<String>());
+    types = cmp::min(types, MAX_SIZE / mem::size_of::<Type>());
+
+    (strings, types)
+}
+
+// Converts a bytes array to an str representation, without copy.
+fn bytes_to_str(buf: &[u8]) -> Result<&str> {
+    CStr::from_bytes_until_nul(buf)
+        .map_err(|e| Error::Format(format!("Could not parse string: {e}")))?
+        .to_str()
+        .map_err(|e| Error::Format(format!("Invalid UTF-8 string: {e}")))
+}

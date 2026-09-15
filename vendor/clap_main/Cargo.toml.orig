@@ -1,0 +1,18 @@
+[package]
+name = "clap_main"
+version = "0.2.9"
+edition = "2021"
+
+description = "A crate to provide a #[clap_main] macro to automatically parse and pass args to your main function"
+license = "GPL-3.0-only"
+repository = "https://git.casuallyblue.dev/sierra/clap_main"
+
+[lib]
+proc-macro = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+proc-macro2 = "1.0.69"
+quote = "1.0.33"
+syn = { version = "2.0.38", features = ["full"] }

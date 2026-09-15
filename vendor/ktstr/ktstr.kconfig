@@ -1,0 +1,294 @@
+# -- Architecture defensives (x86_64) --
+# CONFIG_X86_FRED=y kernels skip idt_syscall_init (arch/x86/kernel/cpu/common.c:2303-2304)
+# and never write MSR_LSTAR. ktstr's virt-KASLR derivation reads MSR_LSTAR to
+# recover the runtime KVA of entry_SYSCALL_64 — FRED would silently break that
+# path and corrupt every per-CPU read on KASLR-enabled boots. Locked off here
+# as a belt-and-suspenders measure since FRED is gaining adoption upstream and
+# an inherited defconfig flip would silently invalidate ktstr's KASLR fix.
+# CONFIG_X86_FRED is not set
+
+# CONFIG_RANDOMIZE_BASE=y forces virt-KASLR on for every ktstr boot. The
+# `kaslr_offset_nonzero_post_boot` e2e test (tests/kaslr_axis_e2e.rs) depends
+# on a non-zero KASLR offset to exercise the freeze_coord → compute_rq_pas
+# wire-in; an inherited defconfig that flipped this off would silently
+# degrade the test into a tautology (kaslr=0 makes the buggy and fixed
+# paths agree on the same PA). Pinning here keeps the assertion meaningful.
+CONFIG_RANDOMIZE_BASE=y
+
+# CONFIG_RANDOMIZE_MEMORY=y randomizes `page_offset_base`, `vmalloc_base`,
+# and `vmemmap_base` at boot — independent of the kernel-image text/data
+# slide which CONFIG_RANDOMIZE_BASE=y above controls. The runtime
+# `page_offset_base` is recovered host-side by reading the symbol via
+# the guest's `/proc/kallsyms` path in `src/vmm/rust_init.rs build_kern_addrs`,
+# shipping the value through `KernAddrs.page_offset_base` (`src/vmm/wire.rs`),
+# and consuming it in `monitor::symbols::kva_to_pa` — the host falls back
+# to `DEFAULT_PAGE_OFFSET` only when `KernAddrs.page_offset_base == 0`
+# (operator escape via `kargs = ["nokaslr"]` on the scheduler decl or
+# `#[ktstr_test(kaslr = false, ...)]` on individual tests). The
+# `kaslr_page_offset_derivation_nonzero` e2e test guards the runtime value:
+# `(page_offset_base - 0xffff_8880_0000_0000) % (1 << 30) == 0 &&
+# page_offset_base != 0xffff_8880_0000_0000` (PUD-aligned slot per
+# arch/x86/mm/kaslr.c::kernel_randomize_memory; ~1/30000 rerun risk on
+# the legitimate slot-0 randomization outcome). Pinning =y here so an
+# inherited defconfig flip can't silently degrade the test back into a
+# tautology where the buggy and fixed direct-map paths agree on the
+# compile-time default.
+CONFIG_RANDOMIZE_MEMORY=y
+
+# CONFIG_GCC_PLUGIN_RANDSTRUCT=n keeps `struct task_struct` field order
+# deterministic across builds. The TaskField cold-path Op handler
+# (`src/vmm/freeze_coord/kernel_op_dispatch.rs`) resolves field byte
+# offsets via the live vmlinux's BTF at dispatch time, so RANDSTRUCT
+# layouts ARE correctly handled when BTF is present. This pin is
+# defense-in-depth: a kernel built without BTF coverage for `task_struct`
+# (extremely stripped vmlinux) combined with RANDSTRUCT would silently
+# read garbage at the wrong byte offsets — the TaskField dispatcher's
+# 6-layer validation would catch obvious corruption (pid mismatch,
+# start_boottime=0) but a fortuitous match could land an undetected
+# write. Disabling RANDSTRUCT removes the dependence on BTF coverage
+# for the task_struct subset that TaskField writes.
+# CONFIG_GCC_PLUGIN_RANDSTRUCT is not set
+
+# -- sched_ext + BPF (required) --
+# sched_ext scheduling class. Depends on BPF_SYSCALL + BPF_JIT + DEBUG_INFO_BTF.
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_JIT=y
+CONFIG_BPF_JIT_ALWAYS_ON=y
+CONFIG_SCHED_CLASS_EXT=y
+
+# -- Debug info (required) --
+# BTF for monitor struct resolution, BPF CO-RE, probe output.
+# DWARF for source locations in probe output.
+# DEBUG_INFO_REDUCED breaks BTF generation — must stay off.
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+CONFIG_DEBUG_INFO_BTF=y
+# Module BTF embeds BTF into .ko files. ktstr runs a monolithic
+# kernel with no loadable modules — the scheduler is a BPF program,
+# not a .ko. Disable to avoid resolve_btfids/pahole crashes during
+# modfinal on some arm64 toolchains.
+# CONFIG_DEBUG_INFO_BTF_MODULES is not set
+# CONFIG_DEBUG_INFO_REDUCED is not set
+
+# -- Tracing/probes (required) --
+# Kprobes for ktstr probe pipeline. ftrace for dynamic attachment
+# and scx scheduler tracing (e.g. LAVD futex tracing).
+# PERF_EVENTS: explicit dep of BPF_EVENTS (provided by defconfig's
+# PROFILING=y, but stated here so the tracing section is self-contained).
+# FTRACE: top-level gate for all tracing infrastructure. arm64 defconfig
+# disables it — without FTRACE=y, KPROBE_EVENTS, BPF_EVENTS, and
+# FUNCTION_TRACER are silently dropped (inside `if FTRACE` in Kconfig).
+CONFIG_FTRACE=y
+CONFIG_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+CONFIG_PERF_EVENTS=y
+# HW_PERF_EVENTS: hardware PMU sampling. On arm64 this is def_bool y
+# guarded on ARM_PMU (drivers/perf/Kconfig); declaring it explicitly
+# makes the dependency visible. Required for sched_ext schedulers
+# (scx_layered, scx_cosmos) that read perf counters via BPF kfuncs.
+# x86 builds ignore this symbol (x86 PMU support is unconditional via
+# CONFIG_PERF_EVENTS above); the symbol is defined only in
+# arch/arm64/Kconfig.
+CONFIG_HW_PERF_EVENTS=y
+# ARM_PMUV3: arm64 PMUv3 driver (drivers/perf/arm_pmuv3.c). bool with
+# `default ARM64` and `depends on HW_PERF_EVENTS && ((ARM && CPU_V7) ||
+# ARM64)` (drivers/perf/Kconfig). On arm64 it would be picked up by
+# defconfig anyway; declaring it explicitly pins the PMU driver in the
+# kconfig fragment so future merge_config runs cannot silently drop it
+# if the dependency chain changes. x86 builds ignore this symbol — it
+# is gated on ARM/ARM64 in drivers/perf/Kconfig.
+CONFIG_ARM_PMUV3=y
+# BPF_EVENTS: default y when deps met (KPROBE_EVENTS + PERF_EVENTS).
+# Explicit for clarity.
+CONFIG_BPF_EVENTS=y
+CONFIG_DEBUG_FS=y
+CONFIG_FUNCTION_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
+# Preempt-disabled duration capture (#64).
+# tp_btf/preempt_disable + preempt_enable handlers in probe.bpf.c
+# attach to the trace_preempt_off / trace_preempt_on tracepoints
+# defined in include/trace/events/preemptirq.h. These tracepoints
+# are emitted from kernel/trace/trace_preemptirq.c only when
+# CONFIG_TRACE_PREEMPT_TOGGLE is set; the option in turn depends
+# on PREEMPT_TRACER (Kconfig under kernel/trace/Kconfig).
+# Without these, the BPF program loads but the two tp_btf attaches
+# silently fail and per-CPU max_ns stays at 0 — graceful degradation
+# matching other optional tp_btf attaches in the probe.
+CONFIG_PREEMPT_TRACER=y
+CONFIG_TRACE_PREEMPT_TOGGLE=y
+
+# -- Boot/console (required) --
+# Init script mounts /proc (reads /proc/cmdline for SHM_BASE),
+# /sys (sysfs for cgroups, tracing), and reads /dev/mem for
+# SHM dump polling.
+#
+# Serial: x86 VMM uses ISA 16550 (COM1/COM2), arm64 uses ns16550a via MMIO.
+# Both drivers are included so the same fragment works on either arch.
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+# FDT-based probing for 8250 ports — required on arm64 where the
+# VMM's ns16550a UARTs are described in the device tree. Without
+# this, the kernel has no driver to match the ns16550a FDT nodes
+# and /dev/ttyS* devices are never created.
+CONFIG_SERIAL_OF_PLATFORM=y
+CONFIG_SERIAL_AMBA_PL011=y
+CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_LZ4=y
+CONFIG_TTY=y
+CONFIG_UNIX98_PTYS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_DEVMEM=y
+# CONFIG_STRICT_DEVMEM is not set
+CONFIG_DEVTMPFS=y
+CONFIG_TMPFS=y
+CONFIG_SHMEM=y
+CONFIG_BINFMT_SCRIPT=y
+# x86 only — arm64 uses earlycon (auto-selected by PL011/8250 drivers).
+CONFIG_EARLY_PRINTK=y
+
+# -- Virtio device support --
+# VIRTIO + VIRTIO_MMIO are the transport layer the VMM exposes; both
+# are required for any virtio device (console, block, or net) to
+# probe. VIRTIO_MMIO_CMDLINE_DEVICES lets the kernel pick up the
+# `virtio_mmio.device=...` kernel cmdline entries the VMM appends so
+# devices land in deterministic probe order. The console device
+# powers /dev/hvc0 for shell mode; the block device is used by tests
+# that need a real disk (DiskConfig); the net device is used by
+# tests that need a NIC and is also a future-proofing knob (#20).
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+
+# -- Filesystems --
+# Btrfs: optional, for DiskConfig::Btrfs when the template-VM
+# lifecycle lands. Requires crypto deps (CRC32, BLAKE2B, SHA256,
+# ZLIB); if deps are not met, make olddefconfig silently drops it.
+# Not in VALIDATE_CONFIG_CRITICAL — v0 uses Filesystem::Raw.
+CONFIG_BTRFS_FS=y
+
+# -- Topology (required) --
+# Multi-socket/core/thread VMs with NUMA.
+# On x86_64, X86_64_ACPI_NUMA is def_bool y when NUMA + ACPI + PCI
+# and selects ACPI_NUMA automatically.
+CONFIG_SMP=y
+# CONFIG_X86_X2APIC=y: x86 guests with >254 vCPUs need x2APIC (32-bit
+# APIC IDs). Legacy xAPIC has only 255 8-bit APIC IDs and the IOAPIC
+# consumes one, capping plain-xAPIC SMP at 254. Without this,
+# MAX_LOCAL_APIC stays 256 (arch/x86/include/asm/apicdef.h) and
+# acpi_parse_x2apic ignores every MADT x2APIC (type-9) entry
+# (arch/x86/kernel/acpi/boot.c — its body is under #ifdef
+# CONFIG_X86_X2APIC), so no CPU with APIC ID >255 can be registered or
+# onlined. x86-only; arm64 ignores the symbol (GICv3 handles wide SMP).
+CONFIG_X86_X2APIC=y
+# CONFIG_NR_CPUS bounds the kernel's compile-time max CPU count. The
+# x86_64 default is 64 — far below the wide-SMP topologies ktstr exercises.
+# x86_64 caps the Kconfig range at 512 without CONFIG_MAXSMP
+# (arch/x86/Kconfig: NR_CPUS_RANGE_END=512 unless MAXSMP selects
+# CPUMASK_OFFSTACK); an out-of-range value is silently dropped back to the
+# default 64. 512 is therefore the max settable without MAXSMP, which we
+# avoid because it force-selects DEBUG_KERNEL (can perturb scheduling
+# timing — unwanted in a scheduler test tool). 512 covers ktstr's wide-SMP
+# guests (the 256-vCPU split-irqchip e2e; the documented 512 ceiling).
+CONFIG_NR_CPUS=512
+CONFIG_NUMA=y
+# HMAT: parses ACPI HMAT for memory tiering (CXL nodes).
+# NUMA_BALANCING: auto-migrates pages to local node based on access.
+CONFIG_ACPI_HMAT=y
+CONFIG_NUMA_BALANCING=y
+
+# -- Cgroups (required) --
+# Scenario cpuset partitioning and CPU controller.
+CONFIG_CGROUPS=y
+CONFIG_CPUSETS=y
+CONFIG_CGROUP_SCHED=y
+
+# -- KVM guest (required) --
+# Steal time accounting: guest scheduler sees actual CPU time
+# (not wall clock including host preemption), producing
+# bare-metal-like scheduling decisions.
+# x86: kvmclock via HYPERVISOR_GUEST + PARAVIRT.
+# arm64: SMCCC PV Time via PARAVIRT (auto-selected by
+#        PARAVIRT_TIME_ACCOUNTING). HYPERVISOR_GUEST is
+#        x86-only and silently ignored on arm64.
+CONFIG_HYPERVISOR_GUEST=y
+CONFIG_PARAVIRT=y
+CONFIG_PARAVIRT_TIME_ACCOUNTING=y
+
+# -- Scheduler features (safe, no behavioral change) --
+# SCHEDSTATS: runtime-disabled by default (static key NOP).
+# Opt in via sysctl kernel.sched_schedstats=1.
+CONFIG_SCHEDSTATS=y
+# SCHED_MC: multi-core scheduling awareness. Affects task
+# placement across cores within a package.
+CONFIG_SCHED_MC=y
+# TASK_DELAY_ACCT: gates /proc/<tid>/stat field 42
+# (delayacct_blkio_ticks). Without this, the field is hard-coded 0
+# in delayacct_blkio_ticks() (include/linux/delayacct.h). Also
+# `select`s SCHED_INFO. Requires runtime opt-in via the `delayacct`
+# kernel cmdline parameter or sysctl kernel.task_delayacct=1
+# (delayacct_on starts at 0 in kernel/delayacct.c).
+# Depends on TASKSTATS, which depends on NET + MULTIUSER. TASKSTATS
+# defaults to n; declare it explicitly so merge_config does not
+# silently drop TASK_DELAY_ACCT.
+CONFIG_TASKSTATS=y
+CONFIG_TASK_DELAY_ACCT=y
+# Symbols for monitor kallsyms resolution.
+CONFIG_KALLSYMS_ALL=y
+# Embedded .config for CONFIG_HZ detection by ktstr monitor.
+# IKCONFIG_PROC exposes /proc/config.gz for runtime inspection.
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+
+# -- Accounting --
+# TASK_IO_ACCOUNTING: gates /proc/<tid>/io
+# (rchar/wchar/syscr/syscw/read_bytes/write_bytes/cancelled_write_bytes,
+# emitted by do_io_accounting() in fs/proc/base.c). The /proc/<tid>/io
+# file itself is registered under #ifdef CONFIG_TASK_IO_ACCOUNTING.
+# Depends on TASK_XACCT (which depends on TASKSTATS, declared above).
+CONFIG_TASK_XACCT=y
+CONFIG_TASK_IO_ACCOUNTING=y
+# PSI: standard pressure-stall infrastructure. Every major distro
+# ships PSI=y. Per-CPU state machines with deferred averaging —
+# minimal scheduling impact. Required for host-level and per-cgroup
+# pressure capture. Active by default when compiled in
+# (PSI_DEFAULT_DISABLED defaults to n); registers
+# /proc/pressure/{io,memory,cpu,irq} via psi_proc_init() and
+# exposes per-cgroup *.pressure files.
+CONFIG_PSI=y
+
+# -- Disabled (would alter scheduler behavior) --
+# LOCKDEP: 10-100x lock overhead. Non-representative timing.
+# Use for catching locking bugs, not for scheduler testing.
+# CONFIG_PROVE_LOCKING is not set
+# CONFIG_DEBUG_LOCKDEP is not set
+# DEBUG_INFO_REDUCED: breaks BTF generation.
+# CONFIG_DEBUG_INFO_SPLIT is not set
+
+# -- Opt-in: changes scheduler behavior intentionally --
+# Uncomment to enable broader test coverage at the cost of
+# different scheduling characteristics.
+#
+# Full preemption (kernel preemptible at most points):
+# CONFIG_PREEMPT=y
+# CONFIG_PREEMPT_DYNAMIC=y
+#
+# Core scheduling (co-schedule trusted tasks on SMT siblings):
+# CONFIG_SCHED_CORE=y
+
+# -- Disable unnecessary subsystems (faster build) --
+# CONFIG_SOUND is not set
+# CONFIG_DRM is not set
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_WIRELESS is not set
+# CONFIG_BLUETOOTH is not set
+# CONFIG_INPUT is not set
+# CONFIG_FB is not set
+# CONFIG_VGA_CONSOLE is not set
+
+# strip: SHT_NOBITS for code sections (8826d5d)

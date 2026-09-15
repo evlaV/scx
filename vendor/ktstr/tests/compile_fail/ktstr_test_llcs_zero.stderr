@@ -1,0 +1,7 @@
+error: llcs must be > 0 (a topology with zero LLCs has zero CPUs — `total_cpus = llcs * cores * threads` — so the VM would boot with no addressable processors)
+ --> tests/compile_fail/ktstr_test_llcs_zero.rs:3:1
+  |
+3 | #[ktstr_test(llcs = 0)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

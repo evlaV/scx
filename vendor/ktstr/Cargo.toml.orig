@@ -1,0 +1,557 @@
+[workspace]
+members = [".", "ktstr-macros", "scx-ktstr"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94.1"
+license = "GPL-2.0-only"
+repository = "https://github.com/likewhatevs/ktstr"
+
+[package]
+name = "ktstr"
+version = "0.18.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Test harness for Linux process schedulers"
+readme = "README.md"
+keywords = ["sched_ext", "scheduler", "testing", "bpf", "linux"]
+categories = ["development-tools::testing"]
+documentation = "https://likewhatevs.github.io/ktstr/api/ktstr/"
+exclude = [".build-cache/", "doc/guide/book/", ".github/", ".githooks/", ".config/"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# Shell-completions generator for the `ktstr completions` /
+# `cargo ktstr completions` subcommands. Only referenced from the
+# bin trees (`src/bin/ktstr.rs` + `src/bin/cargo_ktstr/...`); the
+# library doesn't touch it. Gated behind the `cli-bins` feature so
+# downstream `[dev-dependencies] ktstr = { default-features = false }`
+# consumers drop it from their transitive set.
+clap_complete = { version = "4", optional = true }
+crc32fast = "1.5"
+# Binary serialization for bulk-port TLV payloads (AssertResult,
+# PayloadMetrics, RawPayloadOutput, WorkerReport) and sidecar disk
+# persistence (cast_analysis_load). Pre-1.0 — old sidecar /
+# baseline data is disposable; re-running tests regenerates the
+# cache.
+#
+# postcard chosen over rkyv: ktstr's payloads are <1MB and
+# decoded once per test, so rkyv's zero-copy access wins are
+# irrelevant. postcard's serde-based shape preserves the existing
+# `#[derive(Serialize, Deserialize)]` derives on every payload
+# type — no separate type tree, no derive ceremony, no alignment
+# requirements, no format-pinning headaches.
+postcard = { version = "1", features = ["use-std"] }
+itoa = "1"
+gix = { version = "0.83", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision"] }
+reqwest = { version = "0.13", features = ["blocking"] }
+tar = "0.4"
+tempfile = "3"
+xz2 = { version = "0.1", features = ["static"] }
+# GitHub Actions cache backend, used only by src/remote_cache.rs.
+# Gated behind the `remote-cache` feature (off by default). With
+# the feature off, remote_cache::is_enabled() returns false
+# unconditionally and the lookup/store entry points become no-ops,
+# so call sites need no `#[cfg]` gating.
+opendal = { version = "0.56", default-features = false, features = ["services-ghac"], optional = true }
+# tokio runtime for opendal's async surface in remote_cache.rs.
+# Tied to the same feature as opendal — neither is referenced
+# anywhere else in the crate.
+tokio = { version = "1", features = ["rt"], optional = true }
+zstd = { version = "0.13", features = ["zstdmt"] }
+lz4_flex = { version = "0.13", features = ["frame"] }
+flate2 = "1"
+glob = "0.3"
+# Stack-resident iovec/guard scratch for the virtio-blk vectored
+# read/write handlers (src/vmm/virtio_blk/device.rs): inline capacity
+# MAX_BLK_IOVECS (SEG_MAX*2 = 256) covers the proven worst case so a
+# legitimate-guest request builds its iovec chain with zero heap
+# allocation. Already pulled in transitively (vm-memory / gix /
+# tracing-subscriber and others), so promoting it to a direct dep adds
+# no new crate to the build. cloud-hypervisor uses the same
+# SmallVec<[libc::iovec; N]> pattern in its block device.
+# `const_generics` makes SmallVec<[T; N]> compile for any N (blanket
+# Array impl); without it only smallvec's hand-listed array sizes work,
+# so a future SEG_MAX whose *2 lands on a non-blessed size would fail
+# to compile with an opaque "Array not implemented" error.
+smallvec = { version = "1", features = ["const_generics"] }
+# `proc_macro` default feature kept on: tests/private_module_paths.rs
+# pins the `::ktstr::__private::ctor::ctor(...)` re-export so the
+# proc-macro form stays compilable for downstream consumers.
+ctor = "1"
+libc = "0.2"
+nix = { version = "0.31", features = ["event", "feature", "fs", "inotify", "mount", "poll", "process", "ptrace", "reboot", "sched", "signal", "term", "uio"] }
+blazesym = { version = "0.2", features = ["dwarf"] }
+rand = "0.10"
+rmesg = { version = "1", default-features = false, features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+btf-rs = "2.0"
+kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+kvm-ioctls = "0.24"
+libbpf-rs = { version = "0.26", features = ["vendored"] }
+libbpf-sys = { version = "1.6", features = ["vendored"] }
+linux-loader = { version = "0.13", features = ["bzimage", "elf", "pe"] }
+vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
+vmm-sys-util = "0.15"
+cpio = "0.4.1"
+virtio-bindings = "0.2.7"
+virtio-queue = "0.17"
+vm-superio = "0.8.1"
+zerocopy = { version = "0.8.48", features = ["derive"] }
+linkme = "0.3"
+ktstr-macros = { version = "0.18.0", path = "ktstr-macros" }
+goblin = { version = "0.10.5", features = ["elf64"] }
+# Memory-map /proc/self/exe in `try_flush_profraw` instead of reading
+# the whole binary into a Vec<u8>. Coverage-instrumented test binaries
+# are large (hundreds of MiB to ~1 GiB), and the read+copy cost on the
+# guest's coverage-flush path was a measurable share of teardown
+# latency. Already in the dep tree transitively (blazesym, gix); pinned
+# here so `src/test_support/profraw.rs` doesn't depend on either crate's
+# re-export surface.
+memmap2 = "0.9"
+# DWARF parser for resolving struct-member offsets in jemalloc's tsd_t
+# at probe time (jemalloc-probe binary). Already present transitively
+# via blazesym; pinned as a direct dep so the probe's offset-recovery
+# path doesn't depend on blazesym's re-export surface.
+gimli = "0.33"
+rayon = "1"
+# ELF reader/writer. `features = ["build"]` pulls in the full
+# `object::build::elf::Builder` surface used by `elf_strip.rs` and
+# `cache.rs` for SHT_NOBITS rewriting. `cargo tree --duplicates` may
+# still report a second `object` instance reached transitively via
+# `ar_archive_writer` (build-dep of `psm` / `stacker`) with only the
+# `memchr` feature; that second instance is a build-script compilation
+# artifact and does not link into any shipped binary.
+object = { version = "0.39", default-features = false, features = ["build"] }
+walkdir = "2"
+indicatif = "0.18"
+# Table rendering for stats and verifier CLI output. Replaces hand-rolled
+# `format!("{:<30}...")` layouts plus `"-".repeat()` separators with a
+# builder API that measures column widths from actual content, so labels
+# like `scenario/topology/work_type` stop spilling into adjacent columns
+# when topology names exceed the previously hardcoded 30-column width.
+# Default features pull in crossterm for `Cell::fg(Color::Red/Green)` in
+# the compare_runs VERDICT column; stdout TTY detection is handled by
+# comfy-table itself (see `crate::cli::new_table`).
+comfy-table = "7.2"
+# Stable hash for cache keys — std::hash::DefaultHasher is not
+# guaranteed stable across toolchain versions; siphasher::sip::SipHasher13
+# pins the algorithm so cached artifacts survive Rust updates.
+siphasher = "1"
+# SIMD-accelerated byte-pattern search for IKCONFIG extraction from
+# stripped vmlinux images (tens of MB each). `windows().position()`
+# with an 8-byte needle is O(n) in naive byte compares; memmem uses
+# a two-way algorithm with x86_64 AVX2 / aarch64 Neon when available.
+memchr = "2"
+# C parser for extracting struct definitions from scx BPF source files.
+# Used by cargo-ktstr's BTF type anchor generator to force clang to
+# retain struct types that would otherwise be eliminated by inlining +
+# dead-code elimination. tree-sitter-c parses any C formatting without
+# regex fragility.
+#
+# Only referenced from `src/bin/cargo_ktstr/btf_catalog.rs`, included
+# from the `cargo-ktstr` bin. Gated behind the `cli-bins` feature so
+# downstream `[dev-dependencies] ktstr = { default-features = false }`
+# consumers drop them (plus a handful of small transitives —
+# tree-sitter-language, streaming-iterator) from their build.
+tree-sitter = { version = "0.26", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+# Human-readable duration parsing for the `--watch <interval>` flag on
+# `ktstr locks`. Accepts "100ms", "1s", "5m", "1h" forms per rev 5 §6.
+# Tiny crate (~2 modules, zero non-std deps).
+humantime = "2"
+# Safe wrappers around direct syscalls — replaces ad-hoc
+# `libc::uname`/`libc::flock`/`libc::shm_open` sites that each reinvent
+# fd ownership and errno handling. Keeps the libc dep around because
+# not every call we make has a rustix equivalent we consume yet (mmap,
+# some signal paths), but the flock+uname+shm surface migrates cleanly.
+rustix = { version = "1", features = ["fs", "shm", "system"] }
+# Derive macros for enum-level operations. `VariantNames` auto-generates
+# the list of variant names so `WorkType::ALL_NAMES` stays in lock-step
+# with the enum definition without a hand-maintained parallel table.
+strum = { version = "0.28", features = ["derive"] }
+# Levenshtein edit distance for the "did you mean?" suggestion in
+# `cli::show_thresholds`'s unknown-test-name error path. Already
+# present transitively via clap — promoting it to a direct dep makes
+# the intent explicit and survives a future clap version that drops
+# the transitive exposure.
+strsim = "0.11"
+# Base64 encoder for `cargo ktstr export`'s self-extracting .run files
+# — embeds a gzip tarball after a `__ARCHIVE__` shell-script marker
+# so the bash preamble can `base64 -d | tar xz` the binaries on the
+# target host. Lightweight crate, well-audited, used only at export
+# time (not on the test hot path).
+#
+# Only referenced from `src/export.rs`. Gated behind the `export`
+# feature; the `cli-bins` feature pulls it in transitively so the
+# bin-install flow is unchanged, and the test-binary dispatch path
+# in `test_support/dispatch.rs::maybe_dispatch_export` is compiled
+# out when the feature is off (a downstream `default-features =
+# false` test binary cannot respond to `cargo ktstr export <name>`,
+# which matches the intent — that flow is host-tooling, not a
+# downstream-author surface).
+base64 = { version = "0.22", optional = true }
+# jemalloc as global allocator for the ktstr/cargo-ktstr binaries.
+# binary-only — the library stays allocator-agnostic so downstream
+# consumers pick their own allocator. `stats` feature compiles
+# jemalloc with internal per-allocation bookkeeping so
+# `tikv-jemalloc-ctl`'s `stats.{allocated,active,resident,mapped}`
+# mallctl reads return populated values instead of failing with
+# EPERM; `host_heap::collect` depends on this.
+#
+# Only referenced from the `#[global_allocator]` declarations in the
+# four `src/bin/*.rs` entry points. Gated behind the `cli-bins`
+# feature; with the feature off, `tikv-jemalloc-ctl`'s mallctl reads
+# return Err and `host_heap::collect` lands `None` as documented on
+# the ctl dep below — same observable shape, no allocator swap.
+tikv-jemallocator = { version = "0.6", features = ["stats"], optional = true }
+# Safe wrappers for the jemalloc mallctl introspection surface. Used
+# by `host_heap` to capture the running binary's heap footprint
+# (active / allocated / resident / mapped bytes, arena count) as part
+# of the sidecar's HostContext. Reads return `Err` when the linked
+# allocator is not jemalloc, so downstream consumers that do NOT
+# enable `tikv-jemallocator` land the heap state as `None` cleanly.
+# `stats` feature gates the `stats::*` submodule (allocated/active/
+# resident/mapped); without it the submodule is absent at compile
+# time. `arenas::narenas` is exposed unconditionally.
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+# Regex synthesis from a list of literal strings — used by
+# `ctprof_compare` to render human-readable display labels for
+# pattern-aggregated thread-name groups (e.g. 4 threads named
+# `tokio-runtime-worker-0..3` collapse to a regex showing the
+# shared prefix + alternation). The internal join key stays as the
+# deterministic strip-trailing-digit prefix; grex is invoked at
+# render time only, on bucket-member literals (≥2 entries), to
+# produce a regex string operators can read or paste into tooling.
+# Gated behind the `pretty-labels` feature (off by default); when
+# the feature is disabled, `pattern_display_label` falls back to
+# the join key unchanged — same observable shape, just less polish.
+# `default-features = false` drops the binary CLI surface (clap,
+# colored, indoc) so only the library trait is pulled in.
+grex = { version = "1.4", default-features = false, optional = true }
+# SHA-256 for one-shot digest verification of downloaded artifacts
+# (fetch.rs), cache-key fingerprinting (disk_template.rs), seeded
+# key derivation (fun.rs), and model-cache integrity checks
+# (test_support/model). Not on the test hot path.
+sha2 = "0.11"
+# Lowercase hex encoding for SHA-256 digest comparisons in the
+# model-cache verify path.
+hex = "0.4"
+# Local inference backend for `OutputFormat::LlmExtract`. CPU-only —
+# `openmp` enables OpenMP-parallel matmul (no GPU offload). The GGUF
+# carries its own tokenizer surface, so no separate tokenizer crate is
+# needed. The `sampler` feature enables the `LlamaSampler` builder API
+# (`greedy()`, `accept()`, `sample()`) used by `invoke_with_model`.
+# Build dep on cmake — the linked llama.cpp C++ sources are built from
+# source via `llama-cpp-sys-2`'s build script.
+#
+# Gated behind the `llm` feature (in `default` to preserve behavior,
+# but `--no-default-features` consumers can drop it). When the
+# feature is off, the entire `test_support::model` module is
+# compiled out, and downstream callers in `eval.rs`, `payload_run.rs`,
+# and `cargo-ktstr` are gated alongside it.
+llama-cpp-2 = { version = "0.1.145", default-features = false, features = ["openmp", "sampler"], optional = true }
+# Stateful UTF-8 decoder required by `LlamaModel::token_to_piece` —
+# a single token may carry a partial multi-byte UTF-8 sequence and
+# only a stateful decoder can stitch consecutive tokens into valid
+# UTF-8 without dropping bytes. Already a transitive dep of
+# `llama-cpp-2`; pinned as a direct dep so the call site's intent is
+# explicit and survives a future llama-cpp-2 reorganization that
+# changes its re-export surface. Tied to the same `llm` feature.
+encoding_rs = { version = "0.8", optional = true }
+# Error-enum derives for the `InferenceError` type that
+# `load_inference` and `invoke_with_model` return. Already a
+# transitive dep via `llama-cpp-2`'s own thiserror-derived error
+# types; promoted to a direct dep so the migration's
+# `#[derive(thiserror::Error)]` site is explicit. Pinned at the v2
+# series to match what `llama-cpp-2` already pulls in (v2.0.18);
+# v2's `#[source]` attribute matches the structured-error
+# pattern this crate's error-handling design favors.
+thiserror = "2"
+
+# Compiled regex patterns for the token-based pattern_key
+# normalizer in `ctprof_compare.rs`. Used to express the
+# spec rules in `classify_token` (`^\d+$`, `^[0-9a-f]+$`,
+# `^[A-Za-z]+\d+$`, `^\d+[A-Za-z]+$`) literally rather than as
+# hand-rolled char loops, so the rules read identically to the
+# spec. Already a transitive dep via `fancy-regex` and others;
+# promoted to a direct dep so the import sites are explicit.
+regex = "1"
+
+# Netlink stack for the taskstats genetlink capture path
+# (`src/taskstats.rs`). The three crates layer cleanly:
+#   `netlink-sys`             — AF_NETLINK socket + sendto/recv.
+#   `netlink-packet-core`     — `NetlinkMessage<T>` envelope, ALIGN handling,
+#                                multipart-reply assembly.
+#   `netlink-packet-generic`  — generic-netlink (genetlink): `GenlMessage<T>`
+#                                wrapper, CTRL_CMD_GETFAMILY family-id lookup.
+# Hand-rolled genetlink against raw libc would be ~300 lines of
+# protocol parsing (NLA alignment, multipart NLM_F_MULTI handshake,
+# CTRL family lookup) — established crate stack avoids that
+# correctness risk.
+netlink-sys = "0.8"
+netlink-packet-core = "0.8"
+netlink-packet-generic = "0.4"
+
+# Bindgen-generated bindings for the `perf_event_open(2)` syscall and
+# its `perf_event_attr` struct. The Linux libc and the Rust libc crate
+# both deliberately omit these — perf-event-open-sys provides the
+# bitfield setters (`set_exclude_host`, `set_disabled`) and the
+# kernel-version-tolerant struct layout (per its top-of-crate docs:
+# old programs run on new kernels and vice versa). Used by
+# `src/monitor/perf_counters.rs` to open one fd per (vCPU, hardware
+# counter) with `exclude_host=1` so the PMU counts only what executes
+# inside the guest. Disambiguates host-thread idle/spin/productive
+# work without any in-guest overhead.
+perf-event-open-sys = "6"
+ahash = "0.8"
+
+# Flattened device tree writer for the aarch64 boot path
+# (src/vmm/aarch64/fdt.rs). The arch mod itself is already
+# `#[cfg(target_arch = "aarch64")]`-gated, so the dep follows
+# the same target predicate — x86_64 builds (the majority) skip
+# vm-fdt and its transitives entirely.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+vm-fdt = "0.3"
+
+[profile.release]
+lto = "thin"
+panic = "abort"
+
+# Trim test-binary DWARF to line tables only. Test binaries are
+# large with full debug info, of which DWARF is the dominant
+# component; line-tables-only meaningfully shrinks the binary,
+# reducing cold-load page-fault traffic on CI runners. file:line
+# backtraces stay actionable (assert!/panic!/#[track_caller] all
+# print location), only debugger variable inspection is lost.
+# Override via `CARGO_PROFILE_TEST_DEBUG=full` for a one-off
+# interactive debug session. The nextest sched_stats timeout
+# override stays as defense-in-depth — this addresses the
+# binary-size root cause; the timeout is the symptom budget.
+[profile.test]
+debug = "line-tables-only"
+
+[features]
+default = ["llm", "cli-bins"]
+# `integration` pulls `cli-bins` because the jemalloc introspection
+# fixtures (`ktstr-jemalloc-{probe,alloc-worker}`, gated on cli-bins +
+# integration) are `env!(CARGO_BIN_EXE_…)`'d by their e2es, and cargo
+# resolves features per-build — so the whole e2e suite needs cli-bins for
+# those fixtures to build. (The guest-`/init` memory-constrained OOM is
+# fixed by `vm.overcommit_memory=1` on the guest cmdline, NOT the
+# allocator, so the e2e `/init`'s jemalloc is incidental.) lib.rs
+# `compile_error!`s if this implication is ever broken.
+integration = ["cli-bins"]
+# Dependencies for the `src/bin/*.rs` entry points. The two
+# user-facing bins (`ktstr`, `cargo-ktstr`) carry
+# `required-features = ["cli-bins"]`; the two jemalloc test fixtures
+# (`ktstr-jemalloc-probe`, `ktstr-jemalloc-alloc-worker`) additionally
+# require `integration`, so a default `cargo install ktstr` builds only
+# the two user-facing bins.
+#   - `tikv-jemallocator` — process-wide `#[global_allocator]` swap.
+#   - `clap_complete` — `completions` subcommand on `ktstr` / `cargo-ktstr`.
+#   - `tree-sitter` + `tree-sitter-c` — BTF type-anchor codegen for
+#     cargo-ktstr's test/coverage paths.
+# Default-on so `cargo install --locked ktstr` keeps working unchanged;
+# a `[[bin]]` is silently skipped (rather than failing to compile) when
+# its required features are off. Downstream library consumers wanting a
+# leaner dev-dep transitive set drop these by passing
+# `default-features = false`:
+#
+#   [dev-dependencies]
+#   ktstr = { version = "0.13", default-features = false, features = ["llm"] }
+cli-bins = [
+    "dep:tikv-jemallocator",
+    "dep:clap_complete",
+    "dep:tree-sitter",
+    "dep:tree-sitter-c",
+    "export",
+]
+# `cargo ktstr export` self-extracting `.run` file generator
+# (`src/export.rs`). Gates `base64`. Off-by-default for a
+# `default-features = false` library consumer; the `cli-bins`
+# umbrella feature pulls it in so the bin install flow still has the
+# `export` subcommand wired through the test-binary dispatch path.
+export = ["dep:base64"]
+# Embed the wprof BPF tracer for Perfetto-format profiling in VMs.
+# Default off: first build clones github.com/anakryiko/wprof and
+# compiles libbpf + blazesym (requires git, make, gcc, clang,
+# elfutils-devel, zlib-devel on the host; takes several minutes).
+wprof = ["ktstr-macros/wprof"]
+# Local-CPU LLM extraction (`OutputFormat::LlmExtract`) via the
+# bundled Qwen3-4B GGUF. Pulls in `llama-cpp-2` (compiles llama.cpp
+# C++ via cmake — minutes of build time on a cold cache) plus
+# `encoding_rs`. Default-ON to preserve current behavior; consumers
+# wanting a leaner library (no LLM inference path) can
+# `--no-default-features` and re-enable just the features they want
+# (e.g. `cargo build --no-default-features --features remote-cache,pretty-labels`).
+llm = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# Pretty thread-name labels in `ctprof_compare` output. Enables
+# `grex` regex synthesis to render multi-member buckets as a
+# minimal regex (e.g. `tokio-runtime-worker-[0-3]`). With this
+# feature off, `pattern_display_label` falls back to the join key
+# (e.g. `tokio-runtime-worker`) — identical aggregation, less
+# polish. Worth enabling for interactive use of the compare CLI.
+pretty-labels = ["dep:grex"]
+# GitHub Actions cache integration for cargo-ktstr's blob store
+# (`src/remote_cache.rs`). Off by default: only CI runs with
+# `KTSTR_GHA_CACHE=1` + `ACTIONS_CACHE_URL` set actually use the
+# remote backend. With the feature off, `remote_cache::is_enabled()`
+# returns false and the lookup/store entry points are no-ops, so
+# call sites in `cli/resolve.rs` and `cli/kernel_build/build.rs`
+# transparently skip the remote path. Pulls in `opendal` + a
+# minimal `tokio` runtime; saves both transitive trees on local dev.
+remote-cache = ["dep:opendal", "dep:tokio"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)', 'cfg(coverage_nightly)'] }
+
+[dev-dependencies]
+assert_cmd = "2"
+insta = "1"
+predicates = "3"
+proptest = "1"
+# Rust parser for the function-size guard test
+# (`tests/src_function_size_guard.rs`). `full` enables the
+# fn/impl/expr grammar; `visit` enables the `syn::visit::Visit`
+# traverser that walks every `ItemFn` / `ImplItemFn` /
+# `TraitItemFn` to measure body line spans. Pure-AST walk: no
+# proc-macro context required, so the test runs in the standard
+# integration-test harness without a build script.
+syn = { version = "2", features = ["full", "visit"] }
+# `quote::ToTokens` + `proc_macro2::Span` for the function-size
+# guard's impl-receiver / trait-path rendering. Already in the
+# transitive dep tree via `syn` and `ktstr-macros`; pinned as
+# explicit dev-deps so the test's `use quote::ToTokens` /
+# `proc_macro2::Span` imports resolve without leaning on syn's
+# re-export surface. `span-locations` feature on proc-macro2
+# enables `Span::start()` / `Span::end()` returning
+# `LineColumn`, which the guard uses to measure brace-token
+# body spans.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+# Grok-style structured log matcher. Used by the watchdog timing
+# precision test to extract the sched_ext stall duration from the
+# kernel's SCX_EXIT_ERROR_STALL message ("…failed to run for
+# N.NNNs"). `default-features = false` disables the default `onig`
+# C-regex engine (which would drag in a C library build). The
+# `fancy-regex` engine is the minimum that supports the lookbehind
+# and atomic-group constructs grok's default `BASE10NUM` / `NUMBER`
+# patterns use; the pure-`regex` backend rejects those patterns
+# at compile time.
+grok = { version = "2", default-features = false, features = ["fancy-regex"] }
+# In-test tracing subscriber that captures `tracing::warn!` /
+# `tracing::info!` events into a per-test buffer, queryable via
+# `logs_contain(&str)`. Used by the `set_rt_priority_warns_without_cap`
+# unit test to pin that the CAP_SYS_NICE-absent path emits an
+# actionable warn event — converted from a pure `eprintln!` that no
+# test could observe. Default feature set filters to the current
+# crate's tracing events, which matches the unit-test use case
+# where the event originates from ktstr itself.
+tracing-test = "0.2"
+trybuild = "1"
+mockito = "1"
+# `test-utils` feature on the existing virtio-queue dep — gates the
+# upstream `mock` module (`MockSplitQueue`, `desc_chain` builders)
+# used by virtio-blk descriptor-chain tests. Pinned as a separate
+# dev-dep entry rather than via `features = [...]` on the main
+# `[dependencies]` line so the mock infrastructure does NOT leak
+# into shipped binaries.
+virtio-queue = { version = "0.17", features = ["test-utils"] }
+
+[build-dependencies]
+cc = "1"
+flate2 = "1"
+libbpf-cargo = "0.26"
+reqwest = { version = "0.13", features = ["blocking"] }
+# SHA-256 for build-script tarball integrity verification (busybox
+# pin in build.rs). Same crate the runtime uses for model artifact
+# verification — single algorithm across every hashing site.
+sha2 = "0.11"
+# Stable hash for BTF content drift detection in build.rs.
+# Reusing the same crate ktstr uses for sidecar_variant_hash keeps
+# the dep graph narrow and pins one algorithm across every hashing
+# site in the project. See build.rs `siphash_13` for the call site.
+siphasher = "1"
+tar = "0.4"
+
+[[bin]]
+name = "ktstr"
+path = "src/bin/ktstr.rs"
+required-features = ["cli-bins"]
+
+[[bin]]
+name = "cargo-ktstr"
+path = "src/bin/cargo-ktstr.rs"
+required-features = ["cli-bins"]
+
+[[bin]]
+name = "ktstr-jemalloc-probe"
+path = "src/bin/jemalloc_probe.rs"
+required-features = ["cli-bins", "integration"]
+
+[[bin]]
+name = "ktstr-jemalloc-alloc-worker"
+path = "src/bin/jemalloc_alloc_worker.rs"
+required-features = ["cli-bins", "integration"]
+
+[[test]]
+name = "ktstr_sched_tests"
+
+[[test]]
+name = "failure_dump_e2e"
+
+[[test]]
+name = "cast_analysis_e2e"
+
+[[test]]
+name = "scenario_coverage"
+
+[[test]]
+name = "assert_gate_matrix"
+
+[[test]]
+name = "cargo_ktstr_cli"
+
+[[test]]
+name = "verifier_pipeline"
+
+[[test]]
+name = "compile_fail"
+
+[[test]]
+name = "jemalloc_probe_tests"
+required-features = ["integration"]
+
+# jemalloc / ctprof integration-test fixtures: each env!s
+# CARGO_BIN_EXE_ktstr-jemalloc-{probe,alloc-worker}, so they build only
+# when the (integration-gated) jemalloc bins do.
+[[test]]
+name = "jemalloc_alloc_worker_exit_codes"
+required-features = ["integration"]
+
+[[test]]
+name = "ctprof_capture_jemalloc_wiring"
+required-features = ["integration"]
+
+[[test]]
+name = "jemalloc_probe_signals_test"
+required-features = ["integration"]
+
+[[test]]
+name = "ctprof_capture_jemalloc_e2e"
+required-features = ["integration"]
+
+[[test]]
+name = "ctprof_pipeline_e2e"
+required-features = ["integration"]
+
+[[test]]
+name = "live_host_pipeline_e2e"

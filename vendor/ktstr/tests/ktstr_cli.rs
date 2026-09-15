@@ -1,0 +1,699 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+
+fn ktstr() -> Command {
+    Command::cargo_bin("ktstr").unwrap()
+}
+
+// -- help output --
+
+#[test]
+fn help_lists_subcommands() {
+    ktstr()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("topo"))
+        .stdout(predicate::str::contains("kernel"))
+        .stdout(predicate::str::contains("shell"))
+        .stdout(predicate::str::contains("ctprof"))
+        .stdout(predicate::str::contains("completions"))
+        .stdout(predicate::str::contains("locks"));
+}
+
+#[test]
+fn help_shell() {
+    ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--topology"))
+        .stdout(predicate::str::contains("--memory-mib"));
+}
+
+#[test]
+fn help_shell_shows_exec() {
+    ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exec"));
+}
+
+#[test]
+fn help_shell_shows_dmesg() {
+    ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dmesg"));
+}
+
+#[test]
+fn help_shell_shows_include_files() {
+    ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--include-files"));
+}
+
+#[test]
+fn help_shell_shows_no_perf_mode() {
+    ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-perf-mode"));
+}
+
+#[test]
+fn help_kernel() {
+    ktstr()
+        .args(["kernel", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("clean"));
+}
+
+#[test]
+fn help_kernel_list() {
+    ktstr()
+        .args(["kernel", "list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn help_kernel_build() {
+    ktstr()
+        .args(["kernel", "build", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--source"))
+        .stdout(predicate::str::contains("--git"))
+        .stdout(predicate::str::contains("--ref"))
+        .stdout(predicate::str::contains("--force"))
+        .stdout(predicate::str::contains("--clean"))
+        // `--skip-sha256` is a security-sensitive bypass flag — it
+        // MUST appear in the discoverability surface so an operator
+        // hitting an in-place tarball update at cdn.kernel.org can
+        // find the recovery flag from `--help` alone.
+        .stdout(predicate::str::contains("--skip-sha256"));
+}
+
+#[test]
+fn help_kernel_clean() {
+    ktstr()
+        .args(["kernel", "clean", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--keep"))
+        .stdout(predicate::str::contains("--force"));
+}
+
+// -- error cases --
+
+#[test]
+fn no_subcommand_fails() {
+    ktstr().assert().failure();
+}
+
+#[test]
+fn include_files_nonexistent_path() {
+    ktstr()
+        .args(["shell", "-i", "/nonexistent/path/to/file"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn shell_invalid_topology() {
+    ktstr()
+        .args(["shell", "--topology", "abc"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid topology"));
+}
+
+#[test]
+fn shell_zero_topology() {
+    ktstr()
+        .args(["shell", "--topology", "0,1,1,1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be >= 1"));
+}
+
+// -- completions --
+
+#[test]
+fn completions_bash() {
+    ktstr()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[test]
+fn completions_zsh() {
+    ktstr()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+// -- include-files directory support --
+
+#[test]
+fn include_files_empty_dir_warns() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Empty dir should warn but not fail (the shell command will fail
+    // for other reasons like no KVM, but the include resolution succeeds).
+    // We test via the resolve function rather than the full shell command.
+    let result = ktstr::cli::resolve_include_files(&[tmp.path().to_path_buf()]);
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_empty());
+}
+
+#[test]
+fn include_files_dir_walks_recursively() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("file.txt"), "hello").unwrap();
+    std::fs::write(tmp.path().join("root.txt"), "world").unwrap();
+
+    let result = ktstr::cli::resolve_include_files(&[tmp.path().to_path_buf()]).unwrap();
+    assert_eq!(result.len(), 2);
+    // Archive paths should preserve directory structure.
+    let paths: Vec<&str> = result.iter().map(|(a, _)| a.as_str()).collect();
+    assert!(paths.iter().any(|p| p.contains("root.txt")));
+    assert!(paths.iter().any(|p| p.contains("sub/file.txt")));
+}
+
+// -- virtio-console end-to-end via --exec --
+
+/// Full data path test: host → virtio RX → guest hvc0 → busybox sh -c →
+/// virtio TX → host stdout. Requires /dev/kvm and a cached kernel.
+/// Skips when either is unavailable.
+#[test]
+fn shell_exec_echo() {
+    // Skip if no /dev/kvm.
+    if !std::path::Path::new("/dev/kvm").exists() {
+        eprintln!("skipping shell_exec_echo: /dev/kvm not found");
+        return;
+    }
+    // Skip if no kernel available (don't trigger auto-download in tests).
+    if ktstr::find_kernel().ok().flatten().is_none() {
+        eprintln!("skipping shell_exec_echo: no cached kernel");
+        return;
+    }
+    let output = ktstr()
+        .args(["shell", "--exec", "echo hello-from-guest"])
+        .timeout(std::time::Duration::from_secs(120))
+        .output()
+        .expect("failed to run ktstr shell");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("LLC slots busy") || stderr.contains("CPU") && stderr.contains("busy") {
+        eprintln!("skipping shell_exec_echo: host resource contention");
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "Unexpected failure.\ncode={}\nstderr=```\n{stderr}```",
+        output.status.code().unwrap_or(-1)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello-from-guest"),
+        "stdout missing greeting: {stdout}"
+    );
+}
+
+#[test]
+fn include_files_duplicate_archive_path_errors() {
+    let tmp1 = tempfile::TempDir::new().unwrap();
+    let tmp2 = tempfile::TempDir::new().unwrap();
+    // Create files with the same name in both dirs.
+    let dir1 = tmp1.path().join("data");
+    let dir2 = tmp2.path().join("data");
+    std::fs::create_dir(&dir1).unwrap();
+    std::fs::create_dir(&dir2).unwrap();
+    std::fs::write(dir1.join("file.txt"), "a").unwrap();
+    std::fs::write(dir2.join("file.txt"), "b").unwrap();
+
+    let result = ktstr::cli::resolve_include_files(&[dir1, dir2]);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("duplicate"), "{err}");
+}
+
+// -- topo --
+
+#[test]
+fn topo_shows_cpus() {
+    ktstr()
+        .arg("topo")
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+// -- completions (additional shells) --
+
+#[test]
+fn completions_fish() {
+    ktstr()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[test]
+fn completions_invalid_shell() {
+    ktstr().args(["completions", "noshell"]).assert().failure();
+}
+
+// -- kernel list --
+
+#[test]
+fn kernel_list_runs() {
+    // Isolate from the user's real kernel cache so the assertion is
+    // deterministic. With an empty cache directory, `kernel list`
+    // prints the cache path header on stderr and a "no cached
+    // kernels" hint on stdout.
+    let tmp = tempfile::TempDir::new().unwrap();
+    ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args(["kernel", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no cached kernels"))
+        .stderr(predicate::str::contains("cache:"));
+}
+
+#[test]
+fn kernel_list_json() {
+    ktstr()
+        .args(["kernel", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("entries"));
+}
+
+// -- kernel list legend channel + ordering --
+//
+// Replaces two source-scanning tests (`eol_legend_emits_via_eprintln`
+// and `kernel_list_footer_ordering_pin`) that previously used
+// `include_str!("cli.rs")` + a hand-rolled brace-balanced matcher to
+// static-analyze the cli.rs source for legend emit sites. The new
+// tests exercise the real binary against a fixture cache and assert
+// against captured stdout/stderr — the actual behaviour operators
+// observe, not the source-form of the code that produces it.
+//
+// Fixture shape (shared between both tests):
+//
+//   <tmp_cache>/
+//     valid-untracked/           # metadata.json with ktstr_kconfig_hash: null
+//       metadata.json            # → KconfigStatus::Untracked → "(untracked kconfig)" tag
+//       Image                    # empty sentinel, just needs to exist per cache::list()
+//     valid-stale/               # metadata.json with wrong ktstr_kconfig_hash
+//       metadata.json            # → KconfigStatus::Stale → "(stale kconfig)" tag
+//       Image
+//     corrupt-malformed/         # metadata.json unparseable → ListedEntry::Corrupt
+//       metadata.json            # "{" — invalid JSON
+//
+// `cache::list` sorts Valid entries by built_at descending; Corrupt
+// entries sort last. Untracked and stale are both Valid, so they
+// render in the rows first; corrupt renders last. Legend footers
+// then emit in the documented order (untracked → stale → corrupt).
+// EOL coverage: not fixtured — the `(EOL)` tag requires a non-empty
+// active-prefixes list from kernel.org, which needs network access
+// and a version string that survives the active-prefixes filter. The
+// old source-pattern test pinned all four via static analysis; these
+// integration tests pin the three we can fixture deterministically
+// offline, and the in-source block comment + per-helper unit tests
+// in cli.rs continue to cover EOL's design.
+
+/// Helper: write a valid-shape metadata.json to `dir` with the given
+/// `ktstr_kconfig_hash` (None = untracked, Some(non-matching) = stale).
+/// Also creates an empty `Image` file so `cache::list()` classifies
+/// the directory as [`ListedEntry::Valid`] rather than
+/// image-missing-corrupt. Mirrors the on-disk shape
+/// `cache::CacheDir::store` writes, specified by JSON directly so
+/// the test stays at the CLI boundary (no dependency on the crate's
+/// internal constructors).
+fn write_valid_entry(dir: &std::path::Path, ktstr_kconfig_hash: Option<&str>) {
+    std::fs::create_dir_all(dir).expect("create fixture entry dir");
+    let kconfig = match ktstr_kconfig_hash {
+        Some(h) => format!("\"{h}\""),
+        None => "null".to_string(),
+    };
+    let metadata = format!(
+        "{{\
+         \"version\":\"6.99.0\",\
+         \"source\":{{\"type\":\"tarball\"}},\
+         \"arch\":\"x86_64\",\
+         \"image_name\":\"Image\",\
+         \"config_hash\":null,\
+         \"built_at\":\"2025-01-01T00:00:00Z\",\
+         \"ktstr_kconfig_hash\":{kconfig},\
+         \"extra_kconfig_hash\":null,\
+         \"has_vmlinux\":false,\
+         \"vmlinux_stripped\":false\
+         }}",
+    );
+    std::fs::write(dir.join("metadata.json"), metadata.as_bytes()).expect("write metadata.json");
+    std::fs::write(dir.join("Image"), b"").expect("write Image");
+}
+
+/// Helper: write a deliberately malformed metadata.json so
+/// `cache::list()` surfaces the directory as
+/// [`ListedEntry::Corrupt`]. The body is an incomplete JSON object;
+/// serde_json classifies it as `Category::Syntax`, which the list
+/// path wraps into a `"metadata.json malformed: ..."` reason
+/// string. The tag rendered in the row is `(corrupt)`.
+fn write_corrupt_entry(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).expect("create fixture corrupt dir");
+    std::fs::write(dir.join("metadata.json"), b"{").expect("write malformed metadata.json");
+}
+
+/// Build the shared fixture cache for the legend tests. Returns the
+/// temp dir guard so the caller keeps it alive for the duration of
+/// the spawned binary — dropping it earlier would remove the cache
+/// while `ktstr` is mid-`list`.
+fn build_legend_fixture_cache() -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().expect("tempdir for fixture cache");
+    let root = tmp.path();
+    write_valid_entry(&root.join("valid-untracked"), None);
+    // A 7-char hex-looking string that cannot collide with the
+    // real ktstr.kconfig hash — the CRC32 the cache uses is 8 hex
+    // chars; a 7-char literal guarantees mismatch without assuming
+    // any specific current hash value.
+    write_valid_entry(&root.join("valid-stale"), Some("deadbe7"));
+    write_corrupt_entry(&root.join("corrupt-malformed"));
+    tmp
+}
+
+/// Channel-routing pin: every legend / footer must land on STDERR,
+/// never STDOUT. Downstream scripts redirect stdout to machine-
+/// parseable data (`kernel list > kernels.txt`) and stderr to an
+/// interactive channel; a legend leaked onto stdout would corrupt
+/// the row data for those consumers. Previously pinned by a source-
+/// pattern test scanning cli.rs for `eprintln!`; now pinned by
+/// reading the real binary's streams.
+#[test]
+fn kernel_list_legends_emit_on_stderr() {
+    let cache = build_legend_fixture_cache();
+    let out = ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, cache.path())
+        .args(["kernel", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).expect("stdout utf-8");
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
+
+    // Each of the three offline-fixturable legends must appear in
+    // stderr. The exact wording comes from the *_EXPLANATION consts
+    // / format_corrupt_footer body in cli.rs; pinning a stable
+    // substring from each catches a reword at the CLI boundary
+    // without over-specifying the full string.
+    for needle in [
+        "(untracked kconfig) marks entries",
+        "warning: entries marked (stale kconfig)",
+        "warning: entries marked (corrupt)",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "stderr must contain legend fragment {needle:?}; got:\n{stderr}",
+        );
+        // Same fragment must NOT leak to stdout — the row data
+        // channel stays legend-free for script consumers.
+        assert!(
+            !stdout.contains(needle),
+            "stdout must NOT contain legend fragment {needle:?}; got:\n{stdout}",
+        );
+    }
+}
+
+/// Ordering pin: the four annotation footers emit in a fixed order
+/// (EOL → untracked → stale → corrupt) documented in `kernel_list`'s
+/// emission block. Previously pinned by source-pattern scan of the
+/// function body; now pinned by checking byte offsets of each
+/// legend's fingerprint in captured stderr.
+///
+/// Offline guarantee: the three fixturable legends (untracked,
+/// stale, corrupt) are always present in the output from the
+/// fixture, so their relative ordering is always pinnable. EOL
+/// coverage is conditional — when the kernel.org active-prefixes
+/// fetch succeeds AND the fixture version "6.99.0" does not appear
+/// in the active list, EOL fires and must precede untracked. When
+/// the fetch fails (offline CI, DNS outage) `active_prefixes` is
+/// empty and EOL is silently disabled per `fetch_active_prefixes`'s
+/// error arm; the test still passes on the three we CAN guarantee.
+#[test]
+fn kernel_list_legend_ordering_pins_untracked_stale_corrupt() {
+    let cache = build_legend_fixture_cache();
+    let out = ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, cache.path())
+        .args(["kernel", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).expect("stderr utf-8");
+
+    let i_untracked = stderr
+        .find("(untracked kconfig) marks entries")
+        .expect("untracked legend must appear in stderr");
+    let i_stale = stderr
+        .find("warning: entries marked (stale kconfig)")
+        .expect("stale legend must appear in stderr");
+    let i_corrupt = stderr
+        .find("warning: entries marked (corrupt)")
+        .expect("corrupt footer must appear in stderr");
+
+    assert!(
+        i_untracked < i_stale,
+        "untracked legend must precede stale legend in stderr — \
+         kconfig-tag rebuild recipes are kept adjacent so operators \
+         see both remediation shapes together. \
+         untracked at byte {i_untracked}, stale at {i_stale}:\n{stderr}",
+    );
+    assert!(
+        i_stale < i_corrupt,
+        "stale legend must precede corrupt footer — informational \
+         trio (EOL/untracked/stale) comes before the operationally-\
+         disruptive corrupt entry per the emission block comment in \
+         cli.rs. stale at byte {i_stale}, corrupt at {i_corrupt}:\n{stderr}",
+    );
+
+    // EOL ordering: only enforceable when the fixture's version
+    // was actually tagged EOL by the fetched active-prefixes list.
+    // When the fetch succeeds and classifies 6.99.0 as EOL, the
+    // legend appears in stderr and must precede untracked. When
+    // the fetch fails (offline runner) the legend is absent and
+    // the guard short-circuits to Ok — which is correct since
+    // there's nothing to order.
+    if let Some(i_eol) = stderr.find("(EOL) marks entries") {
+        assert!(
+            i_eol < i_untracked,
+            "EOL legend must precede untracked legend — EOL is \
+             informational-first (upstream-release state, not a \
+             cache pathology) per the emission block comment. \
+             eol at byte {i_eol}, untracked at {i_untracked}:\n{stderr}",
+        );
+    }
+}
+
+// -- --cpu-cap vs KTSTR_BYPASS_LLC_LOCKS conflict — ktstr binary sites --
+//
+// Pins the parse-time rejection when both the --cpu-cap resource
+// contract and the KTSTR_BYPASS_LLC_LOCKS=1 escape hatch are
+// active simultaneously. All three ktstr-binary sites (shell,
+// kernel build, library fallback via shell --no-perf-mode) must
+// bail with "resource contract" in the error text so the operator
+// sees the contradiction before a pipeline deep-bail.
+
+/// `ktstr shell --no-perf-mode --cpu-cap N` under
+/// KTSTR_BYPASS_LLC_LOCKS=1 must fail with "resource contract" in
+/// the error. Pins the rejection at bin/ktstr.rs:577.
+#[test]
+fn ktstr_shell_cpu_cap_with_bypass_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
+        .args(["shell", "--no-perf-mode", "--cpu-cap", "2"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("resource contract"));
+}
+
+/// `ktstr kernel build --cpu-cap N` under
+/// KTSTR_BYPASS_LLC_LOCKS=1 must fail with "resource contract" in
+/// the error. Pins the rejection at bin/ktstr.rs:298.
+#[test]
+fn ktstr_kernel_build_cpu_cap_with_bypass_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-ktstr-cpu-cap-bypass-test",
+            "--cpu-cap",
+            "2",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("resource contract"));
+}
+
+/// Library-layer fallback via `ktstr shell --no-perf-mode` under
+/// `KTSTR_CPU_CAP` + `KTSTR_BYPASS_LLC_LOCKS`. This exercises the
+/// KtstrVmBuilder::build site at vmm/mod.rs:3866 — the CLI binary
+/// checks KTSTR_BYPASS against the --cpu-cap FLAG, but a consumer
+/// setting KTSTR_CPU_CAP env + KTSTR_BYPASS_LLC_LOCKS env (no
+/// --cpu-cap flag) flows through the library-layer check instead.
+/// Both paths must emit "resource contract" so the operator sees
+/// a consistent message regardless of which layer detects the
+/// conflict.
+#[test]
+fn ktstr_library_cpu_cap_env_with_bypass_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_CPU_CAP_ENV, "2")
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
+        .args(["shell", "--no-perf-mode"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("resource contract"));
+}
+
+// -- ctprof compare CLI surface pins --
+//
+// Mirror the `help_kernel_*` and `help_shell_*` shape pins for
+// the `ctprof compare` subcommand: confirm `--help` lists
+// every operator-visible flag (including `--sort-by`), and
+// confirm the binary surfaces parser errors at runtime when an
+// invalid `--sort-by` spec lands. Defends against a regression
+// that drops the flag from the clap struct or breaks the
+// `parse_sort_by` error wrapping.
+
+/// `ktstr ctprof compare --help` lists every documented
+/// flag in the `--help` output. Pins the operator-discovery
+/// path: a flag that's wired in clap but missing from `--help`
+/// would surface here. New flags must be added to the assertion
+/// list below.
+#[test]
+fn help_ctprof_compare_lists_all_flags() {
+    ktstr()
+        .args(["ctprof", "compare", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--group-by"))
+        .stdout(predicate::str::contains("--cgroup-flatten"))
+        .stdout(predicate::str::contains("--no-thread-normalize"))
+        .stdout(predicate::str::contains("--no-cg-normalize"))
+        .stdout(predicate::str::contains("--sort-by"));
+}
+
+/// `ktstr ctprof compare --help` — the `--sort-by` help
+/// text uses the documented "metric" terminology (not "field")
+/// and lists the `asc`/`desc` direction syntax. Pins both the
+/// vocabulary cleanup AND the doc-link removal: the rendered
+/// help must NOT contain rustdoc bracket syntax like
+/// `[CTPROF_METRICS]` (operator-facing leakage).
+#[test]
+fn help_ctprof_compare_sort_by_uses_metric_terminology() {
+    ktstr()
+        .args(["ctprof", "compare", "--help"])
+        .assert()
+        .success()
+        // The help text describes the spec format using the
+        // `metric` terminology.
+        .stdout(predicate::str::contains("metric"))
+        // Both directions must be documented.
+        .stdout(predicate::str::contains("asc"))
+        .stdout(predicate::str::contains("desc"))
+        // Rustdoc bracket syntax must NOT appear in operator
+        // help text. If a future doc edit accidentally
+        // re-introduces `[CTPROF_METRICS]` (the registry
+        // identifier), this assertion would fire.
+        .stdout(predicate::str::contains("[CTPROF_METRICS]").not());
+}
+
+/// `ktstr ctprof compare --help` — the `--sort-by` help
+/// text must NOT use the word "legacy". Pre-1.0 codebase has
+/// no legacy; the default-sort fallthrough is just "default".
+#[test]
+fn help_ctprof_compare_sort_by_no_legacy_word() {
+    ktstr()
+        .args(["ctprof", "compare", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("legacy").not());
+}
+
+/// `ktstr ctprof compare <a> <b> --sort-by <bad-metric>`
+/// returns a non-zero exit and the diagnostic names the
+/// offending metric. The valid metric list also surfaces (the
+/// "must be one of: …" preamble) so an operator typo is
+/// recoverable from the error alone. Pins that
+/// `parse_sort_by`'s rejection bubbles all the way out through
+/// the binary surface.
+#[test]
+fn ctprof_compare_invalid_sort_by_metric_errors() {
+    // Use `/dev/null` for both snapshot paths — the parse_sort_by
+    // error fires BEFORE snapshot loading, so we never reach the
+    // "missing snapshot" path.
+    ktstr()
+        .args([
+            "ctprof",
+            "compare",
+            "/dev/null",
+            "/dev/null",
+            "--sort-by",
+            "not_a_real_metric",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not_a_real_metric"))
+        .stderr(predicate::str::contains("must be one of"));
+}
+
+/// `ktstr ctprof compare <a> <b> --sort-by wait_sum:bogus`
+/// returns a non-zero exit with a diagnostic naming the bad
+/// direction. Pins the direction-side of the parser's error
+/// path (parallel to the bad-metric test above).
+#[test]
+fn ctprof_compare_invalid_sort_by_direction_errors() {
+    ktstr()
+        .args([
+            "ctprof",
+            "compare",
+            "/dev/null",
+            "/dev/null",
+            "--sort-by",
+            "wait_sum:bogus",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid direction"))
+        .stderr(predicate::str::contains("bogus"));
+}
