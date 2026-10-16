@@ -1,0 +1,9 @@
+error: declare_scheduler!: no scheduler source declared. Pick one of:
+         - `binary = "scx_my_sched"` (discover the binary by name)
+         - `binary_path = "/abs/path/to/scx_custom"` (absolute filesystem path)
+         - `kernel_builtin_enable = ["echo 1 > /sys/..."]` + `kernel_builtin_disable = ["echo 0 > /sys/..."]` (in-kernel scheduling policy toggled via shell commands)
+       To test under the kernel-default EEVDF baseline, reference `ktstr::test_support::Scheduler::EEVDF` directly instead of declaring a new scheduler.
+ --> tests/compile_fail/declare_scheduler_missing_binary.rs:9:20
+  |
+9 | declare_scheduler!(MY_SCHED, {
+  |                    ^^^^^^^^

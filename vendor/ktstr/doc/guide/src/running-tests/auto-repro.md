@@ -1,0 +1,194 @@
+# Auto-Repro
+
+When a test fails because the scheduler crashes or exits, auto-repro
+boots a second VM with BPF probes attached to capture function arguments
+and struct fields along the scheduling path. Stack functions extracted
+from the crash output seed the probe list; when no crash stack is
+available (e.g. a BPF text error or verifier failure with no backtrace),
+auto-repro falls back to dynamic BPF program discovery in the repro VM.
+
+## How it works
+
+1. **First VM** -- the test runs normally. If the scheduler crashes or
+   exits (BPF error, verifier failure, stall), ktstr captures any stack
+   trace from the scheduler log (COM2) or kernel console (COM1).
+
+2. **Stack extraction** -- function names are parsed from the crash
+   trace when available. BPF program symbols (`bpf_prog_*`) are
+   recognized and their short names extracted. Generic functions
+   (scheduler entry points, spinlocks, syscall handlers, sched_ext
+   exit machinery, BPF trampolines, stack dump helpers) are filtered
+   out. When no stack functions are found, the pipeline continues with
+   an empty probe list.
+
+3. **BPF discovery** -- in the repro VM, ktstr discovers loaded
+   struct_ops programs via libbpf-rs and adds them to the probe list
+   alongside any stack-extracted functions. Their kernel-side callers
+   are added (e.g. `enqueue` -> `do_enqueue_task`) for bridge kprobes.
+   This step ensures probes can capture variable states across the
+   scheduler exit call chain even when the crash produced no
+   extractable stack.
+
+4. **BTF resolution** -- function signatures are resolved from vmlinux
+   BTF (kernel functions) and program BTF (BPF callbacks). Known struct
+   types (task_struct, rq, scx_dispatch_q, etc.) have curated fields
+   resolved to byte offsets. Other struct pointer params have scalar,
+   enum, and cpumask pointer fields auto-discovered from vmlinux or
+   BPF program BTF.
+
+5. **Second VM** -- ktstr boots a new VM and reruns the scenario with
+   BPF probes:
+   - Kprobe skeleton for kernel function entry (uses `bpf_get_func_ip`)
+   - Fentry/fexit skeleton for BPF callbacks and kernel function exit
+     (batched in groups of 4, shares maps via `reuse_fd`). Fexit
+     re-reads struct fields after the function executes, capturing
+     post-mutation state alongside the entry snapshot.
+   - Tracepoint trigger (`tp_btf/sched_ext_exit`) fires inside
+     `scx_claim_exit()` in `kernel/sched/ext.c` after the
+     atomic exit-kind claim succeeds — one-shot per scheduler
+     instance, in the context of the current task at exit time,
+     before the disable work is queued
+
+6. **Stitching** -- the task_struct pointer is read from the trigger
+   event's `bpf_get_current_task()` value. Events with a task_struct
+   parameter are filtered to that pointer; events without a
+   task_struct parameter are retained if their `task_ptr` (from
+   `bpf_get_current_task()` at probe time) matches the triggering
+   task. Events are sorted by timestamp and
+   formatted with decoded field values (cpumask ranges, DSQ names,
+   enqueue flags, etc.) and source locations (DWARF for kernel,
+   line_info for BPF).
+
+7. **Diagnostic tails** -- the last 40 lines of the repro VM's
+   scheduler log (COM2, cycle-collapsed), sched_ext dump (COM1), the
+   freeze-coordinator failure-dump JSON (when an error-class SCX exit
+   fired), and kernel console (COM1) are appended after the probe
+   output when non-empty. A duration line reports total repro VM wall
+   time. When probe data is absent, a crash reproduction status line
+   indicates whether the crash reproduced.
+
+## Requirements
+
+Auto-repro requires a kernel with the `sched_ext_exit` tracepoint
+(used as the probe trigger). Kernels built with `CONFIG_SCHED_CLASS_EXT`
+and tracepoint support include this. If the tracepoint is unavailable,
+auto-repro is skipped and the pipeline diagnostics report the cause.
+
+## Enabling auto-repro
+
+In `#[ktstr_test]`:
+
+```rust,ignore
+#[ktstr_test(auto_repro = true)]
+fn my_test(ctx: &Ctx) -> Result<AssertResult> { ... }
+```
+
+`auto_repro` defaults to `true` in `#[ktstr_test]`.
+
+## Example output
+
+The `demo_host_crash_auto_repro` test triggers a host-initiated crash
+via BPF map write and captures the scheduling path. Probe output shows
+each function with decoded struct fields and source locations. When
+fexit captures post-mutation state, changed fields show an arrow
+(`→`) between entry and exit values:
+
+```text
+ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l4c1t] failed:
+  scheduler process died unexpectedly during workload (2.0s into test)
+
+--- auto-repro ---
+=== AUTO-PROBE: scx_exit fired ===
+
+  ktstr_enqueue                                                   main.bpf.c:21
+    task_struct *p
+      pid         97
+      cpus_ptr    0xf(0-3)
+      dsq_id      SCX_DSQ_INVALID
+      enq_flags   NONE
+      slice       0
+      vtime       0
+      weight      100
+      sticky_cpu  -1
+      scx_flags   QUEUED|ENABLED
+  do_enqueue_task                                               kernel/sched/ext.c
+    rq *rq
+      cpu         1
+    task_struct *p
+      pid         97
+      cpus_ptr    0xf(0-3)
+      dsq_id      SCX_DSQ_INVALID          →  SCX_DSQ_LOCAL
+      enq_flags   NONE
+      slice       20000000
+      vtime       0
+      weight      100
+      sticky_cpu  -1
+      scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED
+```
+
+After the probe data, the auto-repro section includes the repro VM
+duration and the last 40 lines of the repro VM's scheduler log,
+sched_ext dump, inline failure-dump JSON, and dmesg (each only when
+non-empty).
+
+## When the primary VM never reached the workload
+
+If the primary VM fails before its scheduler ever attached and the
+workload ever started, the auto-repro VM has nothing to reproduce.
+The framework prepends a `PRIMARY DID NOT REACH WORKLOAD` label to
+the repro verdict so the operator knows the repro is non-load-bearing
+— the bug to chase is in the primary's startup path, not in the
+repro VM's output:
+
+```text
+--- auto-repro ---
+PRIMARY DID NOT REACH WORKLOAD — auto-repro is not load-bearing (the primary VM's failure prevented the bug from being exercised, so the repro's verdict below should not be read as evidence about bug reproducibility — the bug was never exercised by either run)
+{repro-verdict-line}
+```
+
+The label is one long line emitted by the framework before the repro
+VM's verdict; `{repro-verdict-line}` is the repro VM's own pass / fail
+summary (still printed after the label, but the prepended sentence
+warns the operator not to treat it as bug-reproducibility evidence).
+
+Triggers include initramfs build failures, kernel boot panics before
+guest init, scheduler-binary missing inside the guest, and any error
+that fires before `ktstr-init` writes the `sys_rdy` token. The repro
+VM still runs and may emit probe data of its own, but the framework
+suppresses the usual verdict comparison because the primary lacked
+the workload run that any repro would be compared against.
+
+Inspect `--- diagnostics ---` for the VM exit kind and the last
+~20 lines of guest console output, and `--- timeline ---` for the
+init-stage progression — the primary-side failure cause lives there.
+
+## Demo test
+
+A demo test in this shape (reduced from
+`demo_host_crash_auto_repro` in `tests/scenario_coverage.rs`):
+
+```rust,ignore
+use ktstr::prelude::*;
+use std::time::Duration;
+
+fn scenario_yield_heavy(ctx: &Ctx) -> Result<AssertResult> {
+    let steps = vec![Step::with_defs(
+        vec![
+            CgroupDef::named("demo_workers")
+                .work_type(WorkType::YieldHeavy)
+                .workers(4),
+        ],
+        HoldSpec::fixed(Duration::from_secs(8)),
+    )];
+    execute_steps(ctx, steps)
+}
+```
+
+Run manually to see full output. The `demo_` prefix auto-ignores via
+the `is_ignored` filter in `src/test_support/dispatch.rs`, so a bare
+invocation will filter the test out — `--run-ignored ignored-only` is
+required:
+
+```sh
+cargo ktstr test --kernel ../linux -- --run-ignored ignored-only -E 'test(demo_host_crash_auto_repro)'
+```

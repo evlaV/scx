@@ -1,0 +1,11 @@
+pub mod acpi;
+pub mod boot;
+pub(crate) mod ioapic;
+pub mod kvm;
+pub mod mptable;
+pub(crate) mod msr_indices;
+pub(crate) mod msr_io;
+pub mod msr_kaslr;
+#[cfg(test)]
+pub(super) mod test_helpers;
+pub mod topology;

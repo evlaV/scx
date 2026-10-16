@@ -1,0 +1,312 @@
+use anyhow::Result;
+use ktstr::assert::AssertResult;
+use ktstr::scenario::Ctx;
+use ktstr::scenario::ops::{CpusetSpec, HoldSpec, Step, execute_steps, execute_steps_with};
+use ktstr::test_support::{KtstrTestEntry, NumaDistance, NumaNode, Topology, TopologyConstraints};
+use ktstr::workload::{MemPolicy, MpolFlags, WorkType};
+
+// All NUMA tests use auto_repro: false — these verify topology plumbing,
+// not scheduler behavior, so BPF crash probes add no diagnostic value.
+
+// Per-worker working-set region (KiB) for the mem-policy locality tests.
+//
+// The default WorkType::SpinWait allocates nothing under the policy, and
+// set_mempolicy governs only FUTURE faults (it cannot relocate the
+// binary/libc/stack pages COW-inherited from the parent before the worker
+// ran). So without a policy-governed allocation the locality metric reflects
+// inherited placement, not the policy. NumaWorkingSetSweep first-touches this
+// region under the cgroup's mem_policy, and the worker scopes page_locality to
+// exactly this region's VMA (src/workload/worker/sched.rs
+// read_numa_maps_region_pages), so the size only needs enough pages for a
+// stable ratio — it does NOT need to dominate the inherited RSS. 64 MiB is
+// well under the per-node guest memory, avoiding node-0 capacity pressure that
+// would spill the allocation.
+const NUMA_LOCALITY_REGION_KIB: usize = 65536; // 64 MiB
+
+// NumaWorkingSetSweep with an EMPTY target_nodes list mmaps a per-worker
+// anonymous region and first-touches every page WITHOUT any mbind override
+// (src/workload/worker/mod.rs) — so the region faults under the cgroup's
+// inherited set_mempolicy on the cpuset-confined (node 0) CPU. sweep_period_ms
+// = 0 keeps the worker CPU-bound (no off-cpu sleep) so the non-locality
+// default_checks behave as they did under SpinWait.
+fn numa_locality_work() -> WorkType {
+    WorkType::NumaWorkingSetSweep {
+        region_kib: NUMA_LOCALITY_REGION_KIB,
+        sweep_period_ms: 0,
+        target_nodes: vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-NUMA boot: 2 NUMA nodes, uniform memory, default 10/20 distances
+// ---------------------------------------------------------------------------
+
+fn scenario_multi_numa_boot(ctx: &Ctx) -> Result<AssertResult> {
+    let topo = &ctx.topo;
+    assert!(
+        topo.num_numa_nodes() >= 2,
+        "expected >= 2 NUMA nodes, got {}",
+        topo.num_numa_nodes()
+    );
+    assert_eq!(topo.numa_distance(0, 0), 10);
+    assert_eq!(topo.numa_distance(1, 1), 10);
+    assert_eq!(topo.numa_distance(0, 1), 20);
+    assert_eq!(topo.numa_distance(1, 0), 20);
+
+    for &nid in topo.numa_node_ids() {
+        let mi = topo
+            .node_meminfo(nid)
+            .unwrap_or_else(|| panic!("node {nid} missing meminfo"));
+        assert!(mi.total_kib > 0, "node {nid} has zero memory");
+    }
+
+    let steps = vec![Step {
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps(ctx, steps)
+}
+
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
+static __KTSTR_ENTRY_MULTI_NUMA_BOOT: KtstrTestEntry = KtstrTestEntry {
+    name: "numa_multi_node_boot",
+    func: scenario_multi_numa_boot,
+    topology: Topology::new(2, 4, 2, 1),
+    constraints: TopologyConstraints {
+        min_numa_nodes: 2,
+        max_numa_nodes: Some(2),
+        ..TopologyConstraints::DEFAULT
+    },
+    auto_repro: false,
+    duration: std::time::Duration::from_secs(3),
+    ..KtstrTestEntry::DEFAULT
+};
+
+// ---------------------------------------------------------------------------
+// CXL memory-only node: node 2 has llcs=0 (no CPUs), only memory.
+// Manual distributed_slice: #[ktstr_test] cannot express with_nodes/distances.
+// ---------------------------------------------------------------------------
+
+static CXL_NODES: [NumaNode; 3] = [
+    NumaNode::new(2, 256),
+    NumaNode::new(2, 256),
+    NumaNode::new(0, 128),
+];
+
+static CXL_DIST: NumaDistance = NumaDistance::new(3, &[10, 20, 30, 20, 10, 25, 30, 25, 10]);
+
+fn scenario_cxl_memory_only(ctx: &Ctx) -> Result<AssertResult> {
+    let topo = &ctx.topo;
+    assert_eq!(topo.num_numa_nodes(), 3, "expected 3 NUMA nodes");
+
+    assert!(topo.is_memory_only(2), "node 2 must be memory-only");
+    assert!(!topo.is_memory_only(0), "node 0 has CPUs");
+    assert!(!topo.is_memory_only(1), "node 1 has CPUs");
+
+    assert_eq!(topo.numa_distance(0, 2), 30);
+    assert_eq!(topo.numa_distance(1, 2), 25);
+
+    let mi = topo.node_meminfo(2).expect("CXL node 2 must have meminfo");
+    assert!(mi.total_kib > 0, "CXL node must have memory");
+
+    let steps = vec![Step {
+        setup: vec![ctx.cgroup_def("cg_0")].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps(ctx, steps)
+}
+
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
+static __KTSTR_ENTRY_CXL_MEM_ONLY: KtstrTestEntry = KtstrTestEntry {
+    name: "numa_cxl_memory_only_node",
+    func: scenario_cxl_memory_only,
+    topology: Topology::with_nodes(2, 1, &CXL_NODES).distances(&CXL_DIST),
+    constraints: TopologyConstraints {
+        min_numa_nodes: 3,
+        max_numa_nodes: Some(3),
+        ..TopologyConstraints::DEFAULT
+    },
+    memory_mib: 640,
+    auto_repro: false,
+    duration: std::time::Duration::from_secs(3),
+    ..KtstrTestEntry::DEFAULT
+};
+
+// ---------------------------------------------------------------------------
+// MemPolicy::Bind + min_page_locality assertion
+// ---------------------------------------------------------------------------
+
+fn scenario_mempolicy_bind_locality(ctx: &Ctx) -> Result<AssertResult> {
+    let checks = ktstr::assert::Assert::default_checks().min_page_locality(0.5);
+    let steps = vec![Step {
+        setup: vec![
+            ctx.cgroup_def("cg_0")
+                .cpuset(CpusetSpec::Numa(0))
+                .mem_policy(MemPolicy::bind([0]))
+                .work_type(numa_locality_work()),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
+}
+
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
+static __KTSTR_ENTRY_MEMPOLICY_BIND: KtstrTestEntry = KtstrTestEntry {
+    name: "numa_mempolicy_bind_locality",
+    func: scenario_mempolicy_bind_locality,
+    topology: Topology::new(2, 4, 2, 1),
+    constraints: TopologyConstraints {
+        min_numa_nodes: 2,
+        max_numa_nodes: Some(2),
+        ..TopologyConstraints::DEFAULT
+    },
+    auto_repro: false,
+    duration: std::time::Duration::from_secs(5),
+    ..KtstrTestEntry::DEFAULT
+};
+
+// ---------------------------------------------------------------------------
+// vmstat cross-node migration tracking
+// ---------------------------------------------------------------------------
+
+fn scenario_vmstat_migration(ctx: &Ctx) -> Result<AssertResult> {
+    let checks = ktstr::assert::Assert::default_checks().max_cross_node_migration_ratio(0.5);
+    let steps = vec![Step {
+        setup: vec![
+            ctx.cgroup_def("cg_0")
+                .cpuset(CpusetSpec::Numa(0))
+                .mem_policy(MemPolicy::bind([0])),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
+}
+
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
+static __KTSTR_ENTRY_VMSTAT_MIGRATION: KtstrTestEntry = KtstrTestEntry {
+    name: "numa_vmstat_migration_tracking",
+    func: scenario_vmstat_migration,
+    topology: Topology::new(2, 4, 2, 1),
+    constraints: TopologyConstraints {
+        min_numa_nodes: 2,
+        max_numa_nodes: Some(2),
+        ..TopologyConstraints::DEFAULT
+    },
+    auto_repro: false,
+    duration: std::time::Duration::from_secs(5),
+    ..KtstrTestEntry::DEFAULT
+};
+
+// ---------------------------------------------------------------------------
+// MemPolicy::Interleave round-robins allocations across BOTH nodes, so the
+// expected page locality on the binding-cpuset half is roughly 50%. The
+// scenario pins workers to node 0 via cpuset but interleaves their pages
+// across nodes 0 and 1, so the locality assertion sets a low minimum.
+// Exercises the round-robin nodemask path that Bind/Preferred don't reach.
+//
+// The cgroup runs a NumaWorkingSetSweep region (see `numa_locality_work`)
+// first-touched under this policy, so `page_locality` measures the
+// policy-governed allocation rather than the worker's COW-inherited RSS.
+//
+// `MpolFlags::STATIC_NODES` is required because without it the kernel
+// silently intersects the interleave nodemask with the task's cpuset —
+// which would degenerate to "interleave across {0} only" and defeat the
+// cross-node intent.
+// ---------------------------------------------------------------------------
+
+fn scenario_mempolicy_interleave_cross_node(ctx: &Ctx) -> Result<AssertResult> {
+    let checks = ktstr::assert::Assert::default_checks().min_page_locality(0.3);
+    let steps = vec![Step {
+        setup: vec![
+            ctx.cgroup_def("cg_0")
+                .cpuset(CpusetSpec::Numa(0))
+                .mem_policy(MemPolicy::interleave([0, 1]))
+                .mpol_flags(MpolFlags::STATIC_NODES)
+                .work_type(numa_locality_work()),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
+}
+
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
+static __KTSTR_ENTRY_MEMPOLICY_INTERLEAVE: KtstrTestEntry = KtstrTestEntry {
+    name: "numa_mempolicy_interleave_cross_node",
+    func: scenario_mempolicy_interleave_cross_node,
+    topology: Topology::new(2, 4, 2, 1),
+    constraints: TopologyConstraints {
+        min_numa_nodes: 2,
+        max_numa_nodes: Some(2),
+        ..TopologyConstraints::DEFAULT
+    },
+    auto_repro: false,
+    duration: std::time::Duration::from_secs(5),
+    ..KtstrTestEntry::DEFAULT
+};
+
+// ---------------------------------------------------------------------------
+// MemPolicy::PreferredMany lists multiple nodes that the kernel may use for
+// allocation, falling back across the set rather than a single fallback path.
+// Workers are pinned to node 0; the policy prefers nodes 0 and 1, so most
+// pages should land on node 0 with the minority spilling to node 1.
+// Exercises the MPOL_PREFERRED_MANY (kernel 5.15+) path that
+// `MemPolicy::Preferred` cannot express.
+//
+// The cgroup runs a NumaWorkingSetSweep region (see `numa_locality_work`)
+// first-touched under this policy. MPOL_PREFERRED_MANY is local-first
+// (the running CPU's node leads the zonelist), so on the node-0-pinned
+// worker the region lands on node 0. `page_locality` is scoped to this
+// region's VMA, so it measures the policy-governed allocation, not the
+// worker's COW-inherited whole-process RSS.
+//
+// `MpolFlags::STATIC_NODES` is required so node 1 stays in the preferred
+// set — without it the kernel narrows the nodemask to the cpuset (node 0
+// only), collapsing the PreferredMany semantics into a single-node
+// preferred that this test is not exercising.
+// ---------------------------------------------------------------------------
+
+fn scenario_mempolicy_preferred_many_locality(ctx: &Ctx) -> Result<AssertResult> {
+    let checks = ktstr::assert::Assert::default_checks().min_page_locality(0.5);
+    let steps = vec![Step {
+        setup: vec![
+            ctx.cgroup_def("cg_0")
+                .cpuset(CpusetSpec::Numa(0))
+                .mem_policy(MemPolicy::preferred_many([0, 1]))
+                .mpol_flags(MpolFlags::STATIC_NODES)
+                .work_type(numa_locality_work()),
+        ]
+        .into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    execute_steps_with(ctx, steps, Some(&checks))
+}
+
+#[ktstr::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::linkme)]
+static __KTSTR_ENTRY_MEMPOLICY_PREFERRED_MANY: KtstrTestEntry = KtstrTestEntry {
+    name: "numa_mempolicy_preferred_many_locality",
+    func: scenario_mempolicy_preferred_many_locality,
+    topology: Topology::new(2, 4, 2, 1),
+    constraints: TopologyConstraints {
+        min_numa_nodes: 2,
+        max_numa_nodes: Some(2),
+        ..TopologyConstraints::DEFAULT
+    },
+    auto_repro: false,
+    duration: std::time::Duration::from_secs(5),
+    ..KtstrTestEntry::DEFAULT
+};

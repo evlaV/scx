@@ -1,0 +1,189 @@
+//! Dynamic cgroup add/remove scenario implementations.
+
+use super::backdrop::Backdrop;
+use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_scenario};
+use super::{Ctx, collect_all, dfl_wl, setup_cgroups};
+use crate::assert::AssertResult;
+use crate::workload::*;
+use anyhow::Result;
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Add up to two cgroups mid-run alongside two steady cgroups.
+///
+/// `cg_0` and `cg_1` run for the whole scenario; `cg_2` / `cg_3`
+/// appear mid-run as a step-local CgroupDef set and tear down at
+/// the step boundary. Steady cgroups go on the Backdrop;
+/// mid-run additions stay step-local.
+pub fn custom_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
+    let max_new = ctx.topo.total_cpus().saturating_sub(3).min(2);
+    if max_new == 0 {
+        return Ok(AssertResult::skip("need >=4 CPUs"));
+    }
+
+    let extra_names: &[&str] = &["cg_2", "cg_3"];
+    let phase2_setup: Vec<CgroupDef> = extra_names[..max_new]
+        .iter()
+        .map(|&name| CgroupDef::named(name))
+        .collect();
+
+    let backdrop = Backdrop::new()
+        .push_cgroup(CgroupDef::named("cg_0"))
+        .push_cgroup(CgroupDef::named("cg_1"));
+    let steps = vec![
+        // Phase 1: settle with just the two steady cgroups.
+        Step::new(vec![], ctx.settled_hold(0.5)),
+        // Phase 2: add the step-local extras.
+        Step::with_defs(phase2_setup, HoldSpec::frac(0.5)),
+    ];
+
+    execute_scenario(ctx, backdrop, steps)
+}
+
+/// Remove half of up to four cgroups mid-run.
+///
+/// The kept half (`cg_0`, `cg_1`) lives on the Backdrop and
+/// persists across both Steps. The ephemeral half (`cg_2` / `cg_3`,
+/// up to the topology limit) is a step-local Step-0 CgroupDef set
+/// whose automatic per-Step teardown IS the "remove mid-run"
+/// event — no explicit `Op::stop_cgroup` / `Op::remove_cgroup`
+/// ops required. Step 1 is then a pure hold with only the
+/// Backdrop cgroups still present.
+pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
+    let n = 4.min(ctx.topo.total_cpus().saturating_sub(1));
+    if n < 2 {
+        return Ok(AssertResult::skip("need >=3 CPUs"));
+    }
+    let half = n / 2;
+
+    let cgroup_names: &[&str] = &["cg_0", "cg_1", "cg_2", "cg_3"];
+
+    let mut backdrop = Backdrop::new();
+    for &name in &cgroup_names[..half] {
+        backdrop = backdrop.push_cgroup(CgroupDef::named(name));
+    }
+
+    let step0_defs: Vec<CgroupDef> = cgroup_names[half..n]
+        .iter()
+        .map(|&name| CgroupDef::named(name))
+        .collect();
+
+    let steps = vec![
+        Step::with_defs(step0_defs, ctx.settled_hold(0.5)),
+        Step::new(vec![], HoldSpec::frac(0.5)),
+    ];
+
+    execute_scenario(ctx, backdrop, steps)
+}
+
+/// Rapid create/destroy cycling. Custom logic for dynamic naming.
+pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
+    let (handles, mut guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
+    let deadline = Instant::now() + ctx.duration;
+    let mut i = 0usize;
+    // Cap on the number of distinct ephemeral cgroup names. The
+    // remove path is best-effort (see comment below); without a cap
+    // a long scenario with persistent EBUSY/ENOENT churn would
+    // accumulate one cgroup per iteration in the cgroupfs tree until
+    // the guard's Drop reaps them at scenario teardown. Reusing the
+    // same 100 names via `i % 100` bounds peak resident cgroup count
+    // to at most 100 leaked entries, while still exercising the
+    // rapid create→remove churn the test is designed to drive.
+    // `create_cgroup` is idempotent on a name whose dir already
+    // exists (`if !p.exists()` in `CgroupManager::create_cgroup`), so
+    // a cycle that lapped a still-resident sibling is a no-op
+    // re-create rather than an error.
+    //
+    // Each ephemeral name is registered in the `setup_cgroups` guard
+    // via `add_cgroup_no_cpuset` (NOT `ctx.cgroups.create_cgroup`)
+    // so the guard's Drop reaps any cgroup whose best-effort
+    // remove_cgroup below failed. Without registration, a
+    // best-effort failure would silently leak the cgroup until the
+    // next iteration with the same modulo-100 name happened to win
+    // its create→remove race; if no such iteration arrived before
+    // the loop exited, the cgroup persisted past scenario teardown
+    // (the comment claiming the guard reaped it was wrong — the
+    // guard only reaps names it has been told about). Duplicate
+    // pushes of the same name across cycles are harmless: Drop
+    // iterates `names` and calls remove_cgroup for each, which
+    // returns ENOENT after the first successful removal — and
+    // `is_io_not_found` filters that case from the warn output.
+    const MAX_EPHEMERAL_NAMES: usize = 100;
+    while Instant::now() < deadline {
+        let n = format!("ephemeral_{}", i % MAX_EPHEMERAL_NAMES);
+        guard.add_cgroup_no_cpuset(&n)?;
+        thread::sleep(Duration::from_millis(100));
+        // Best-effort teardown: rapid-churn drives cgroup
+        // create/destroy at 10 Hz, racing the freeze/drain path.
+        // EBUSY (kernel still draining from a sibling step) or
+        // ENOENT (already removed by the guard's Drop on early
+        // exit) here leaves the cgroup tree slightly larger than
+        // expected for one iteration; the guard's Drop reaps any
+        // leaked cgroups at scenario teardown. Bailing would
+        // truncate the churn workload and mask the race.
+        if let Err(e) = ctx.cgroups.remove_cgroup(&n) {
+            tracing::warn!(cgroup = %n, err = %format!("{e:#}"), "rapid churn: remove_cgroup failed; guard Drop will reap on scenario teardown");
+        }
+        i = i.wrapping_add(1);
+    }
+    Ok(collect_all(handles, &ctx.assert))
+}
+
+/// Add a third cpuset-partitioned cgroup mid-run; tear it down
+/// via automatic step boundary.
+///
+/// `cg_0` / `cg_1` hold their cpusets for the full scenario on the
+/// Backdrop. `cg_2` lives only in the middle Step — the automatic
+/// step-boundary teardown removes it before the final hold runs,
+/// replacing the pre-refactor explicit stop + remove ops.
+pub fn custom_cgroup_cpuset_add_remove(ctx: &Ctx) -> Result<AssertResult> {
+    if ctx.topo.all_cpus().len() < 4 {
+        return Ok(AssertResult::skip("need >=4 CPUs"));
+    }
+
+    let backdrop = Backdrop::new().extend_cgroups([
+        CgroupDef::named("cg_0").cpuset(CpusetSpec::disjoint(0, 3)),
+        CgroupDef::named("cg_1").cpuset(CpusetSpec::disjoint(1, 3)),
+    ]);
+    let steps = vec![
+        // Phase 1: settle the two steady cgroups.
+        Step::new(vec![], ctx.settled_hold(1.0 / 3.0)),
+        // Phase 2: add cg_2; auto teardown at step end removes it.
+        Step::with_defs(
+            vec![CgroupDef::named("cg_2").cpuset(CpusetSpec::disjoint(2, 3))],
+            HoldSpec::frac(1.0 / 3.0),
+        ),
+        // Phase 3: only cg_0 / cg_1 continue — cg_2 is gone.
+        Step::new(vec![], HoldSpec::frac(1.0 / 3.0)),
+    ];
+
+    execute_scenario(ctx, backdrop, steps)
+}
+
+/// Add a third cgroup under load alongside heavy and bursty cgroups.
+///
+/// The heavy `cg_0` and bursty `cg_1` run for the full scenario on
+/// the Backdrop. The mid-run `cg_2` appears in the second Step and
+/// tears down at the step boundary.
+pub fn custom_cgroup_add_during_imbalance(ctx: &Ctx) -> Result<AssertResult> {
+    let backdrop = Backdrop::new().extend_cgroups([
+        CgroupDef::named("cg_0").workers(8),
+        CgroupDef::named("cg_1")
+            .workers(2)
+            .work_type(WorkType::bursty(
+                Duration::from_millis(50),
+                Duration::from_millis(100),
+            )),
+    ]);
+    let steps = vec![
+        // Phase 1: settle with cg_0 and cg_1 alone.
+        Step::new(vec![], ctx.settled_hold(0.5)),
+        // Phase 2: add cg_2 as step-local.
+        Step::with_defs(
+            vec![CgroupDef::named("cg_2").workers(4)],
+            HoldSpec::frac(0.5),
+        ),
+    ];
+
+    execute_scenario(ctx, backdrop, steps)
+}

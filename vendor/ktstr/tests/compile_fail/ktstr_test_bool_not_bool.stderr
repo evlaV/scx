@@ -1,0 +1,5 @@
+error: expected bool literal for auto_repro
+ --> tests/compile_fail/ktstr_test_bool_not_bool.rs:3:27
+  |
+3 | #[ktstr_test(auto_repro = 42)]
+  |                           ^^
