@@ -1,0 +1,912 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+
+fn cargo_ktstr() -> Command {
+    let mut cmd = Command::cargo_bin("cargo-ktstr").unwrap();
+    cmd.arg("ktstr");
+    cmd
+}
+
+// -- help output --
+
+#[test]
+fn help_lists_subcommands() {
+    cargo_ktstr()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("test"))
+        .stdout(predicate::str::contains("shell"))
+        .stdout(predicate::str::contains("kernel"))
+        .stdout(predicate::str::contains("verifier"))
+        .stdout(predicate::str::contains("completions"))
+        // `LlvmCov` variant renders as `llvm-cov` (clap derive
+        // kebab-case default). Pinned with the two-space leading
+        // indent that `HelpTemplate::subcmd` emits before every
+        // subcommand name (clap_builder-4.6.0/src/output/mod.rs:21
+        // `TAB = "  "` + help_template.rs:1070-1071 which pushes
+        // TAB then the name). This discriminates the subcommand
+        // list entry from incidental doc-text occurrences of
+        // "llvm-cov" that would satisfy a bare substring check.
+        .stdout(predicate::str::contains("  llvm-cov"))
+        // `visible_alias = "nextest"` on the Test variant makes
+        // the alias user-facing. Pinned by the literal
+        // `[aliases: nextest]` tag emitted by
+        // `HelpTemplate::sc_spec_vals` at clap_builder-4.6.0/src/
+        // output/help_template.rs:1043 — the styled-ANSI wrappers
+        // collapse to empty strings under `assert_cmd`'s non-TTY
+        // capture so the plain tag appears verbatim. A regression
+        // that dropped `visible_alias` (or switched to the
+        // non-visible `alias` form, which `sc_spec_vals` ignores
+        // at :1026 where it calls `get_visible_aliases`) would
+        // strip the tag and fail this assertion.
+        .stdout(predicate::str::contains("[aliases: nextest]"));
+}
+
+#[test]
+fn help_test() {
+    cargo_ktstr()
+        .args(["test", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--no-perf-mode"))
+        .stdout(predicate::str::contains("cargo nextest"));
+}
+
+/// `cargo ktstr nextest --help` reaches the same help page as
+/// `cargo ktstr test --help` via the `visible_alias = "nextest"`
+/// on the Test variant. Pins that the alias is wired as an alias
+/// (not a separate variant) — the help page inherits `--kernel`,
+/// `--no-perf-mode`, and the "cargo nextest" passthrough doc.
+#[test]
+fn help_nextest_alias() {
+    cargo_ktstr()
+        .args(["nextest", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--no-perf-mode"));
+}
+
+/// `cargo ktstr llvm-cov --help` renders the LlvmCov variant's
+/// help page. The variant's about text advertises `cargo llvm-cov`
+/// passthrough, and both `--kernel` + `--no-perf-mode` are
+/// declared on the variant — any of the three would fail if a
+/// clap regression re-generated the subcommand with drifted
+/// metadata.
+#[test]
+fn help_llvm_cov() {
+    cargo_ktstr()
+        .args(["llvm-cov", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--no-perf-mode"))
+        .stdout(predicate::str::contains("cargo llvm-cov"));
+}
+
+#[test]
+fn help_shell() {
+    cargo_ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--topology"))
+        .stdout(predicate::str::contains("--memory-mib"))
+        .stdout(predicate::str::contains("--no-perf-mode"));
+}
+
+/// `cargo ktstr export --help` exposes the four flags the router
+/// dispatches on: `<TEST>` positional, `--output`/-o, `--package`/-p
+/// (workspace disambiguation), and `--release` (profile pin).
+/// Pins the router CLI surface so a future clap regression
+/// that drops one of these flags is caught at the help-text level
+/// before it surfaces as a misleading "test not found" error in the
+/// router.
+#[test]
+fn help_export() {
+    cargo_ktstr()
+        .args(["export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--output"))
+        .stdout(predicate::str::contains("--package"))
+        .stdout(predicate::str::contains("--release"))
+        .stdout(predicate::str::contains("<TEST>"));
+}
+
+/// `cargo ktstr export <missing>` exits non-zero with a router
+/// diagnostic. Pins the "test not found in any workspace test
+/// binary" error path: the router builds tests, exec's each, sees
+/// every candidate fail with "no registered test named X", and
+/// surfaces a bundled error mentioning the candidate count and the
+/// last per-binary stderr.
+///
+/// `#[ignore]`-d because the router executes a full
+/// `cargo build --tests` over the entire workspace, compiling
+/// every integration test binary — minutes of build time, too
+/// heavy for the default `cargo nextest run` pass. Run via
+/// `cargo nextest run --include-ignored -E 'test(export_unknown_test_errors)'`
+/// to opt in locally.
+#[test]
+#[ignore = "runs cargo build --tests over the full workspace; minutes of compile time"]
+fn export_unknown_test_errors() {
+    cargo_ktstr()
+        .args(["export", "definitely_not_a_real_ktstr_test_xyzzy_987"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("not found in any workspace test binary").or(
+                predicate::str::contains("definitely_not_a_real_ktstr_test_xyzzy_987"),
+            ),
+        );
+}
+
+#[test]
+fn help_kernel() {
+    cargo_ktstr()
+        .args(["kernel", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("clean"));
+}
+
+#[test]
+fn help_kernel_list() {
+    cargo_ktstr()
+        .args(["kernel", "list", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn help_kernel_build() {
+    cargo_ktstr()
+        .args(["kernel", "build", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--source"))
+        .stdout(predicate::str::contains("--git"))
+        .stdout(predicate::str::contains("--ref"))
+        .stdout(predicate::str::contains("--force"))
+        .stdout(predicate::str::contains("--clean"))
+        .stdout(predicate::str::contains("--extra-kconfig"))
+        // `--extra-kconfig` doc must explain that `make olddefconfig`
+        // resolves dependencies — the help is the discoverability
+        // surface for the merge pipeline. A regression that dropped
+        // the explanation would leave operators guessing why a
+        // fragment line silently disappeared from the final
+        // `.config`.
+        .stdout(predicate::str::contains("olddefconfig"))
+        // `--skip-sha256` is a security-sensitive bypass flag — it
+        // MUST appear in the discoverability surface so an operator
+        // hitting an in-place tarball update at cdn.kernel.org can
+        // find the recovery flag from `--help` alone.
+        .stdout(predicate::str::contains("--skip-sha256"));
+}
+
+/// `kernel build --extra-kconfig <nonexistent>` must surface an
+/// actionable error containing the user's input path verbatim, so a
+/// typo names the exact string they passed. Pin the diagnostic
+/// shape `--extra-kconfig {path}: {fs error}` produced by
+/// `kernel_build`'s up-front file read.
+///
+/// `KTSTR_CACHE_DIR` is pointed at a tempdir so this test does not
+/// touch the developer's real cache root, and `--source` is set to
+/// a clearly-nonexistent path so even if the extra-kconfig check
+/// were skipped (and the source-tree validation fired instead), the
+/// command would still bail before any network or build work.
+#[test]
+fn kernel_build_extra_kconfig_nonexistent_path_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-extra-kconfig-source-test",
+            "--extra-kconfig",
+            "/definitely/not/a/real/file/ktstr-extra-kconfig-test.kconfig",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--extra-kconfig"))
+        .stderr(predicate::str::contains(
+            "/definitely/not/a/real/file/ktstr-extra-kconfig-test.kconfig",
+        ));
+}
+
+/// A directory passed to `--extra-kconfig` must surface a clear
+/// "is a directory" error. The 4-arm error
+/// classification in [`ktstr::cli::read_extra_kconfig`] maps the
+/// kernel's EISDIR to "is a directory; pass a file" — pin that
+/// the operator-facing message names BOTH `--extra-kconfig` and
+/// the offending path.
+#[test]
+fn kernel_build_extra_kconfig_directory_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("not-a-file");
+    std::fs::create_dir(&dir).unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-test-dir-arg",
+            "--extra-kconfig",
+        ])
+        .arg(&dir)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--extra-kconfig"))
+        .stderr(predicate::str::contains("is a directory"));
+}
+
+/// A non-UTF-8 file passed to `--extra-kconfig` must surface a
+/// clear "not valid UTF-8"
+/// error. `read_extra_kconfig` rejects with a message that names
+/// `--extra-kconfig` + the path so the operator can fix the file.
+/// kconfig fragments are required to be ASCII text per kbuild's
+/// own parser.
+#[test]
+fn kernel_build_extra_kconfig_invalid_utf8_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("invalid.kconfig");
+    // Lone 0xff is invalid UTF-8 — Vec<u8> with a single 0xff byte
+    // fails String::from_utf8 with `Utf8Error`.
+    std::fs::write(&path, [0xffu8]).unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-test-utf8-arg",
+            "--extra-kconfig",
+        ])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--extra-kconfig"))
+        .stderr(predicate::str::contains("not valid UTF-8"));
+}
+
+/// An empty file passed to `--extra-kconfig` is NOT an error —
+/// `read_extra_kconfig` warns but proceeds. The
+/// build then bails when the source-tree check fails (we point
+/// `--source` at a nonexistent path), proving the empty-file
+/// branch passed through without aborting on the fragment read.
+/// stderr carries both the empty-file warning AND the source-tree
+/// failure, confirming sequence: empty fragment → warn → continue
+/// → source-tree fail.
+#[test]
+fn kernel_build_extra_kconfig_empty_file_warns_but_proceeds() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("empty.kconfig");
+    std::fs::write(&path, b"").unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        // RUST_LOG ensures the tracing::warn! emission lands on
+        // stderr where the integration test can observe it.
+        .env("RUST_LOG", "warn")
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-test-empty-arg",
+            "--extra-kconfig",
+        ])
+        .arg(&path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--extra-kconfig file is empty"));
+}
+
+/// Symlink chain resolution. A `--extra-kconfig` argument that
+/// points at a symlink chain
+/// (link → link → file) must resolve transparently — the
+/// `read_extra_kconfig` helper uses `std::fs::read` which goes
+/// through `open(2)` and follows symlinks per kernel default
+/// (the same way kbuild reads `KCONFIG_CONFIG`). Pin that a
+/// chain of two symlinks resolves to the underlying file's
+/// contents without manual canonicalization.
+///
+/// Test passes when the build proceeds past the fragment-read
+/// stage (we point `--source` at a nonexistent path so the
+/// command bails on source-tree validation, AFTER the fragment
+/// is successfully read). If symlink resolution were broken,
+/// `read_extra_kconfig` would error before reaching the source
+/// stage and stderr would carry the "--extra-kconfig …" error
+/// instead of the source-tree error.
+#[test]
+fn kernel_build_extra_kconfig_symlink_chain_resolves() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let real = tmp.path().join("real.kconfig");
+    std::fs::write(&real, b"CONFIG_KTSTR_SYMLINK_TEST=y\n").unwrap();
+    let link1 = tmp.path().join("link1.kconfig");
+    let link2 = tmp.path().join("link2.kconfig");
+    // Build link1 → real, link2 → link1 (two-hop chain).
+    std::os::unix::fs::symlink(&real, &link1).unwrap();
+    std::os::unix::fs::symlink(&link1, &link2).unwrap();
+    let assert = cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-symlink-test",
+            "--extra-kconfig",
+        ])
+        .arg(&link2)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    // Must NOT carry the `--extra-kconfig` error string — the
+    // fragment was read successfully through the chain. The
+    // failure that surfaces is the source-tree validation
+    // (since --source points at nothing), proving the read
+    // completed before that next stage.
+    assert!(
+        !stderr.contains("--extra-kconfig"),
+        "symlink chain must resolve transparently — read_extra_kconfig \
+         should not surface a `--extra-kconfig` error when the chain \
+         resolves to a readable file. stderr={stderr:?}"
+    );
+}
+
+/// The `--extra-kconfig` validation fires BEFORE source
+/// acquisition. A nonexistent extra-kconfig path
+/// MUST produce the `--extra-kconfig`-named error even when
+/// `--source` is also nonexistent — proving the error precedence.
+/// If the order were reversed the test would see the
+/// source-tree error instead.
+#[test]
+fn kernel_build_extra_kconfig_validation_fires_before_source_acquire() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-source-precedence-test",
+            "--extra-kconfig",
+            "/nonexistent/ktstr-extra-precedence-test.kconfig",
+        ])
+        .assert()
+        .failure()
+        // The error MUST name --extra-kconfig (not source-tree
+        // failure). `read_extra_kconfig` runs first in
+        // `kernel_build`, so its 4-arm classifier surfaces the
+        // ENOENT before `kernel_build_one`'s source-acquire branch
+        // would have fired.
+        .stderr(predicate::str::contains("--extra-kconfig"))
+        .stderr(predicate::str::contains(
+            "/nonexistent/ktstr-extra-precedence-test.kconfig",
+        ));
+}
+
+#[test]
+fn help_kernel_clean() {
+    cargo_ktstr()
+        .args(["kernel", "clean", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--keep"))
+        .stdout(predicate::str::contains("--force"));
+}
+
+#[test]
+fn help_verifier() {
+    cargo_ktstr()
+        .args(["verifier", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--raw"));
+}
+
+#[test]
+fn help_completions() {
+    cargo_ktstr()
+        .args(["completions", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<SHELL>"))
+        .stdout(predicate::str::contains("possible values: bash"));
+}
+
+// -- error cases --
+
+#[test]
+fn no_subcommand_fails() {
+    cargo_ktstr().assert().failure();
+}
+
+// -- completions --
+
+#[test]
+fn completions_bash_produces_output() {
+    cargo_ktstr()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[test]
+fn completions_zsh_produces_output() {
+    cargo_ktstr()
+        .args(["completions", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[test]
+fn completions_fish_produces_output() {
+    cargo_ktstr()
+        .args(["completions", "fish"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
+}
+
+#[test]
+fn completions_invalid_shell() {
+    cargo_ktstr()
+        .args(["completions", "noshell"])
+        .assert()
+        .failure();
+}
+
+// -- shell flags in help --
+
+#[test]
+fn help_shell_shows_exec() {
+    cargo_ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--exec"));
+}
+
+#[test]
+fn help_shell_shows_dmesg() {
+    cargo_ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dmesg"));
+}
+
+#[test]
+fn help_shell_shows_include_files() {
+    cargo_ktstr()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--include-files"));
+}
+
+// -- error cases --
+
+#[test]
+fn include_files_nonexistent_path() {
+    cargo_ktstr()
+        .args(["shell", "-i", "/nonexistent/path/to/file"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn shell_invalid_topology() {
+    cargo_ktstr()
+        .args(["shell", "--topology", "abc"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid topology"));
+}
+
+// -- stats --
+
+#[test]
+fn stats_no_data() {
+    // Pin the read path to an empty directory via KTSTR_SIDECAR_DIR
+    // so the test is independent of whatever sits under the
+    // developer's target/ktstr/. Bare `cargo ktstr stats` honors
+    // KTSTR_SIDECAR_DIR (cli.rs print_stats_report). With nothing
+    // there to read the empty-state notice goes to stderr and
+    // stdout stays clean.
+    let tmp = tempfile::tempdir().unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_SIDECAR_DIR_ENV, tmp.path())
+        .args(["stats"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no sidecar data found"))
+        .stdout(predicate::str::is_empty());
+}
+
+// -- kernel list --
+
+#[test]
+fn kernel_list_runs() {
+    // Isolate from the user's real kernel cache so the assertion is
+    // deterministic. With an empty cache directory, `kernel list`
+    // prints the cache path header on stderr and a "no cached
+    // kernels" hint on stdout.
+    let tmp = tempfile::TempDir::new().unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args(["kernel", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no cached kernels"))
+        .stderr(predicate::str::contains("cache:"));
+}
+
+#[test]
+fn kernel_list_json() {
+    cargo_ktstr()
+        .args(["kernel", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("entries"));
+}
+
+// -- --cpu-cap vs KTSTR_BYPASS_LLC_LOCKS conflict — cargo-ktstr sites --
+//
+// Pins the parse-time rejection when both the --cpu-cap resource
+// contract and the KTSTR_BYPASS_LLC_LOCKS=1 escape hatch are
+// active simultaneously. Both sites (cargo-ktstr shell and
+// cargo-ktstr kernel build) must bail with "resource contract" in
+// the error text so the operator sees the contradiction before a
+// pipeline deep-bail.
+
+/// `cargo ktstr shell --no-perf-mode --cpu-cap N` under
+/// KTSTR_BYPASS_LLC_LOCKS=1 must fail with the "resource contract"
+/// substring. Pins the rejection at bin/cargo-ktstr.rs:851.
+#[test]
+fn cargo_ktstr_shell_cpu_cap_with_bypass_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
+        .args(["shell", "--no-perf-mode", "--cpu-cap", "2"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("resource contract"));
+}
+
+/// `cargo ktstr kernel build --cpu-cap N` under
+/// KTSTR_BYPASS_LLC_LOCKS=1 must fail with the "resource contract"
+/// substring. Pins the rejection at bin/cargo-ktstr.rs:729.
+#[test]
+fn cargo_ktstr_kernel_build_cpu_cap_with_bypass_errors() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Pass a clearly-nonexistent --source so if the conflict check
+    // were somehow skipped, we'd get a source-acquire failure (not
+    // a network fetch hanging forever in CI).
+    cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-cargo-ktstr-cpu-cap-bypass-test",
+            "--cpu-cap",
+            "2",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("resource contract"));
+}
+
+// -- --extra-kconfig CLI integration --
+//
+// These integration tests use `KTSTR_CACHE_DIR` isolation and the
+// `cargo ktstr kernel list --json` output / `kernel build` clap
+// surface to verify the `--extra-kconfig` plumbing without spinning
+// a real kernel build (network + 5+ minutes per build, unacceptable
+// in `cargo nextest` runs). The pattern: plant fixture cache
+// entries in the production `metadata.json` shape, then exercise
+// the JSON listing + build dispatch through assert_cmd.
+//
+// Cache-key derivation roundtrip semantics are also unit-tested at
+// the library level in `src/lib.rs::tests::cache_lookup_*` (planted
+// CacheDir + lookup); these CLI tests pin the assert_cmd FRONTEND
+// surface that scripts/automation consume.
+
+/// Cache-roundtrip: write the SAME cache fixture twice and verify
+/// `kernel list --json` returns the same entry with the same
+/// `extra_kconfig_hash` value byte-for-byte across runs. Pins the
+/// extras-aware lookup-by-key contract: identical extras content
+/// must always produce the same cache key suffix derivation, so a
+/// re-run with the same extras hits the same slot rather than
+/// missing and re-building.
+#[test]
+fn extra_kconfig_cache_roundtrip() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let entry_dir = tmp.path().join("test-extras-roundtrip-bbbb1111");
+    std::fs::create_dir_all(&entry_dir).unwrap();
+    std::fs::write(entry_dir.join("bzImage"), b"fake kernel image").unwrap();
+    let metadata_json = serde_json::json!({
+        "version": "6.14.2",
+        "source": {"type": "tarball"},
+        "arch": "x86_64",
+        "image_name": "bzImage",
+        "config_hash": null,
+        "built_at": "2026-04-22T00:00:00Z",
+        "ktstr_kconfig_hash": null,
+        "extra_kconfig_hash": "f00d1234",
+        "has_vmlinux": false,
+        "vmlinux_stripped": false,
+    });
+    std::fs::write(
+        entry_dir.join("metadata.json"),
+        serde_json::to_string_pretty(&metadata_json).unwrap(),
+    )
+    .unwrap();
+
+    // First lookup: extras-built entry must surface.
+    let run = |label: &str| {
+        let output = cargo_ktstr()
+            .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+            .args(["kernel", "list", "--json"])
+            .output()
+            .unwrap_or_else(|e| panic!("{label}: kernel list --json must run: {e}"));
+        assert!(
+            output.status.success(),
+            "{label}: kernel list --json must succeed; stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let stdout_a = run("first run");
+    let stdout_b = run("second run");
+
+    let parse_hash = |stdout: &str| -> String {
+        let parsed: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        parsed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"].as_str() == Some("test-extras-roundtrip-bbbb1111"))
+            .expect("planted extras entry must appear in both runs")["extra_kconfig_hash"]
+            .as_str()
+            .expect("extra_kconfig_hash must be present")
+            .to_string()
+    };
+    let hash_a = parse_hash(&stdout_a);
+    let hash_b = parse_hash(&stdout_b);
+    assert_eq!(
+        hash_a, hash_b,
+        "same fixture must surface the same extra_kconfig_hash across runs — \
+         cache-roundtrip identity"
+    );
+    assert_eq!(
+        hash_a, "f00d1234",
+        "hash must round-trip the planted value verbatim"
+    );
+}
+
+/// Cache miss on different content: plant entries A and B with
+/// distinct `extra_kconfig_hash` values; both must appear, and
+/// each must carry its own hash distinct from the other. Pins the
+/// segregation that prevents an extras=A build from being silently
+/// served when the operator asks for extras=B.
+#[test]
+fn extra_kconfig_cache_miss_on_different_content() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    let plant = |key: &str, extras_hash: serde_json::Value, built_at: &str| {
+        let dir = tmp.path().join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bzImage"), b"fake kernel image").unwrap();
+        let meta = serde_json::json!({
+            "version": "6.14.2",
+            "source": {"type": "tarball"},
+            "arch": "x86_64",
+            "image_name": "bzImage",
+            "config_hash": null,
+            "built_at": built_at,
+            "ktstr_kconfig_hash": null,
+            "extra_kconfig_hash": extras_hash,
+            "has_vmlinux": false,
+            "vmlinux_stripped": false,
+        });
+        std::fs::write(
+            dir.join("metadata.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    };
+    plant(
+        "test-extras-miss-AAAA-bbbb2222",
+        serde_json::json!("aaaaaaaa"),
+        "2026-04-22T00:00:00Z",
+    );
+    plant(
+        "test-extras-miss-BBBB-bbbb3333",
+        serde_json::json!("bbbbbbbb"),
+        "2026-04-23T00:00:00Z",
+    );
+
+    let output = cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args(["kernel", "list", "--json"])
+        .output()
+        .expect("kernel list --json must run");
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let entries = parsed["entries"].as_array().expect("entries array");
+    let entry_a = entries
+        .iter()
+        .find(|e| e["key"].as_str() == Some("test-extras-miss-AAAA-bbbb2222"))
+        .expect("entry A must appear");
+    let entry_b = entries
+        .iter()
+        .find(|e| e["key"].as_str() == Some("test-extras-miss-BBBB-bbbb3333"))
+        .expect("entry B must appear");
+    assert_eq!(entry_a["extra_kconfig_hash"].as_str(), Some("aaaaaaaa"));
+    assert_eq!(entry_b["extra_kconfig_hash"].as_str(), Some("bbbbbbbb"));
+    assert_ne!(
+        entry_a["extra_kconfig_hash"], entry_b["extra_kconfig_hash"],
+        "different extras content must produce distinct cache slots — \
+         a build with extras=B must not be served entry A's cached kernel"
+    );
+}
+
+/// Range expansion parse roundtrip: `cargo ktstr kernel build
+/// 6.14..6.16 --extra-kconfig PATH` must reach the dispatch
+/// without clap rejecting the range + extras combination. Each
+/// version in the expanded range receives the same extras content
+/// per the production loop in `kernel_build`'s range branch.
+///
+/// We don't drive a real network kernel.org fetch from a unit
+/// test, so we verify the parser accepts the combination by
+/// pointing `--source` at a nonexistent path (range mode requires
+/// neither `--source` nor `--git`, but the test below reaches the
+/// non-range branch which still proves the flag plumbing) AND by
+/// verifying `--help` documents the flag combination.
+#[test]
+fn extra_kconfig_range_expansion() {
+    // Help-text surface: `kernel build --help` must list
+    // `--extra-kconfig` so an operator can discover the flag.
+    cargo_ktstr()
+        .args(["kernel", "build", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--extra-kconfig"));
+
+    // Parse-level test: write a valid fragment, run with a range
+    // shape AND --extra-kconfig. The build will fail at network
+    // fetch (kernel.org/releases.json), proving clap accepted the
+    // combination — the failure mode must NOT be a clap error.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let frag = tmp.path().join("extras.kconfig");
+    std::fs::write(&frag, "CONFIG_FOO=y\n").unwrap();
+
+    // Use `--source` (not a range) to short-circuit before the
+    // network fetch — the test's invariant is that `--extra-kconfig`
+    // parses cleanly alongside the rest of `kernel build`'s flag
+    // surface, which the range loop reuses verbatim. A clap-level
+    // rejection of the combination would surface BEFORE the source-
+    // acquire path runs.
+    let assert_result = cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .env(ktstr::KTSTR_BYPASS_LLC_LOCKS_ENV, "1")
+        .args([
+            "kernel",
+            "build",
+            "--source",
+            "/nonexistent/ktstr-extras-range-test",
+            "--extra-kconfig",
+            frag.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert_result.get_output().stderr.clone()).unwrap();
+    assert!(
+        !stderr.contains("error: the argument") && !stderr.contains("cannot be used with"),
+        "clap must accept `--extra-kconfig` alongside the build dispatch \
+         (the range loop reuses this same flag set for every version); \
+         got stderr: {stderr}"
+    );
+}
+
+/// `kernel list --json` output must include an `extra_kconfig_hash`
+/// field on every cached entry so an operator's automation can
+/// distinguish builds that carried `--extra-kconfig` from bare
+/// builds. Pins the JSON contract: field is present, is the planted
+/// hex string for extras-built entries, and `null` for bare ones.
+#[test]
+fn extra_kconfig_kernel_list_shows_hash() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Plant one bare entry and one extras entry side-by-side.
+    let bare_dir = tmp.path().join("test-list-shows-hash-bare-bbbb4444");
+    std::fs::create_dir_all(&bare_dir).unwrap();
+    std::fs::write(bare_dir.join("bzImage"), b"bare kernel").unwrap();
+    let bare_meta = serde_json::json!({
+        "version": "6.14.2",
+        "source": {"type": "tarball"},
+        "arch": "x86_64",
+        "image_name": "bzImage",
+        "config_hash": null,
+        "built_at": "2026-04-22T00:00:00Z",
+        "ktstr_kconfig_hash": null,
+        "extra_kconfig_hash": null,
+        "has_vmlinux": false,
+        "vmlinux_stripped": false,
+    });
+    std::fs::write(
+        bare_dir.join("metadata.json"),
+        serde_json::to_string_pretty(&bare_meta).unwrap(),
+    )
+    .unwrap();
+
+    let extras_dir = tmp.path().join("test-list-shows-hash-extras-bbbb5555");
+    std::fs::create_dir_all(&extras_dir).unwrap();
+    std::fs::write(extras_dir.join("bzImage"), b"extras kernel").unwrap();
+    let extras_meta = serde_json::json!({
+        "version": "6.14.2",
+        "source": {"type": "tarball"},
+        "arch": "x86_64",
+        "image_name": "bzImage",
+        "config_hash": null,
+        "built_at": "2026-04-23T00:00:00Z",
+        "ktstr_kconfig_hash": null,
+        "extra_kconfig_hash": "cafef00d",
+        "has_vmlinux": false,
+        "vmlinux_stripped": false,
+    });
+    std::fs::write(
+        extras_dir.join("metadata.json"),
+        serde_json::to_string_pretty(&extras_meta).unwrap(),
+    )
+    .unwrap();
+
+    let output = cargo_ktstr()
+        .env(ktstr::KTSTR_CACHE_DIR_ENV, tmp.path())
+        .args(["kernel", "list", "--json"])
+        .output()
+        .expect("kernel list --json must run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let entries = parsed["entries"].as_array().expect("entries array");
+    let bare = entries
+        .iter()
+        .find(|e| e["key"].as_str() == Some("test-list-shows-hash-bare-bbbb4444"))
+        .expect("bare entry must appear");
+    let extras = entries
+        .iter()
+        .find(|e| e["key"].as_str() == Some("test-list-shows-hash-extras-bbbb5555"))
+        .expect("extras entry must appear");
+
+    // Both entries must have the field present (key existence
+    // pins the schema contract). Bare = null, extras = hex string.
+    assert!(
+        bare.get("extra_kconfig_hash").is_some(),
+        "bare entry must surface the `extra_kconfig_hash` JSON key (= null) \
+         so consumers can distinguish 'no extras' from 'field missing'"
+    );
+    assert!(bare["extra_kconfig_hash"].is_null());
+    assert_eq!(
+        extras["extra_kconfig_hash"].as_str(),
+        Some("cafef00d"),
+        "extras entry must surface the planted hash verbatim"
+    );
+}

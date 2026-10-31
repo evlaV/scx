@@ -1,0 +1,5 @@
+error: expected integer literal
+ --> tests/compile_fail/ktstr_test_int_not_int.rs:3:21
+  |
+3 | #[ktstr_test(llcs = "two")]
+  |                     ^^^^^

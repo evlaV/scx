@@ -1,0 +1,7 @@
+error: duration_s must be > 0 (a zero-duration run never exercises the scheduler and produces no data for assertions)
+ --> tests/compile_fail/ktstr_test_duration_s_zero.rs:3:1
+  |
+3 | #[ktstr_test(duration_s = 0)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

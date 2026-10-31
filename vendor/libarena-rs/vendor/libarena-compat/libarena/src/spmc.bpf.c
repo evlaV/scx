@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: LGPL-2.1 OR BSD-2-Clause
+/*
+ * Copyright (c) 2025-2026 Meta Platforms, Inc. and affiliates.
+ * Copyright (c) 2025-2026 Emil Tsalapatis <etsal@meta.com>
+ */
+
+#include <bpf_atomic.h>
+
+#include <libarena/common.h>
+
+#include <libarena/asan.h>
+#include <libarena/spmc.h>
+
+static inline
+u64 spmc_arr_size(volatile struct spmc_arr __arena *spmc_arr __arg_arena)
+{
+	return SPMC_ARR_BASESZ << spmc_arr->order;
+}
+
+static inline
+u64 spmc_arr_get(volatile struct spmc_arr __arena *spmc_arr __arg_arena, u64 ind)
+{
+	u64 ret = READ_ONCE(spmc_arr->data[ind % spmc_arr_size(spmc_arr)]);
+
+	return ret;
+}
+
+static inline
+int spmc_arr_put(volatile struct spmc_arr __arena *spmc_arr __arg_arena, u64 ind, u64 value)
+{
+	WRITE_ONCE(spmc_arr->data[ind % spmc_arr_size(spmc_arr)], value);
+
+	return 0;
+}
+
+static inline
+int spmc_arr_copy(volatile struct spmc_arr __arena *dst __arg_arena,
+		   volatile struct spmc_arr __arena *src __arg_arena, u64 b, u64 t)
+{
+	u64 i;
+
+	bpf_for(i, t, b)
+		spmc_arr_put(dst, i, spmc_arr_get(src, i));
+
+	return 0;
+}
+
+static inline
+int spmc_order_init(struct spmc __arena *spmc __arg_arena, int order)
+{
+	volatile struct spmc_arr __arena *arr = &spmc->arr[order];
+
+	if (unlikely(!spmc))
+		return -EINVAL;
+
+	if (order >= SPMC_ARR_ORDERS)
+		return -E2BIG;
+
+	/* Already allocated? */
+	if (arr->data)
+		return 0;
+
+	arr->data = arena_malloc((SPMC_ARR_BASESZ << order) * sizeof(*arr->data));
+	if (!arr->data)
+		return -ENOMEM;
+
+	return 0;
+}
+
+__weak
+int spmc_owned_add(struct spmc __arena *spmc __arg_arena, u64 val)
+{
+	volatile struct spmc_arr __arena *newarr;
+	volatile struct spmc_arr __arena *arr;
+	ssize_t sz;
+	u64 b, t;
+	int ret;
+
+	if (unlikely(!spmc))
+		return -EINVAL;
+
+	/* 
+	 * Bottom must always be read first, also
+	 * see spmc_steal().
+	 */
+	b = smp_load_acquire(&spmc->bottom);
+	t = READ_ONCE(spmc->top);
+	arr = READ_ONCE(spmc->cur);
+
+	sz = b - t;
+	if (sz >= spmc_arr_size(arr) - 1) {
+		ret = spmc_order_init(spmc, arr->order + 1);
+		if (ret)
+			return ret;
+
+		newarr = &spmc->arr[arr->order + 1];
+
+		spmc_arr_copy(newarr, arr, b, t);
+		smp_store_release(&spmc->cur, newarr);
+		arr = newarr;
+	}
+
+	spmc_arr_put(arr, b, val);
+	smp_store_release(&spmc->bottom, b + 1);
+
+	return 0;
+}
+
+
+__weak
+int spmc_owned_remove(struct spmc __arena *spmc __arg_arena, u64 *val)
+{
+	volatile struct spmc_arr __arena *arr;
+	int ret = 0;
+	ssize_t sz;
+	u64 value;
+	u64 b, t;
+
+	if (unlikely(!spmc || !val))
+		return -EINVAL;
+
+	b = READ_ONCE(spmc->bottom) - 1;
+	WRITE_ONCE(spmc->bottom, b);
+	smp_mb();
+
+	t = READ_ONCE(spmc->top);
+	arr = READ_ONCE(spmc->cur);
+
+	sz = b - t;
+	if (sz < 0) {
+		WRITE_ONCE(spmc->bottom, t);
+		return -ENOENT;
+	}
+
+	value = spmc_arr_get(arr, b);
+	if (sz > 0) {
+		*val = value;
+		return 0;
+	}
+
+	if (cmpxchg(&spmc->top, t, t + 1) != t)
+		ret = -EAGAIN;
+
+	WRITE_ONCE(spmc->bottom, t + 1);
+
+	if (ret)
+		return ret;
+
+	*val = value;
+
+	return 0;
+}
+
+__weak
+int spmc_steal(struct spmc __arena *spmc __arg_arena, u64 *val)
+{
+	volatile struct spmc_arr __arena *arr;
+	ssize_t sz;
+	u64 value;
+	u64 b, t;
+
+	if (unlikely(!spmc || !val))
+		return -EINVAL;
+
+	/*
+	 * It is important that t is read before b for
+	 * stealers to avoid racing with the owner.
+	 * Races between stealers are dealt with using
+	 * CAS to increment the top value below.
+	 */
+	t = smp_load_acquire(&spmc->top);
+	b = smp_load_acquire(&spmc->bottom);
+
+	sz = b - t;
+	if (sz <= 0)
+		return -ENOENT;
+
+	arr = smp_load_acquire(&spmc->cur);
+	value = spmc_arr_get(arr, t);
+
+	if (cmpxchg(&spmc->top, t, t + 1) != t)
+		return -EAGAIN;
+
+	*val = value;
+
+	return 0;
+}
+
+
+__weak
+u64 spmc_create_internal(void)
+{
+	/*
+	 * Marked as volatile because otherwise the array
+	 * reference in the internal loop gets demoted to
+	 * scalar and the program fails verification.
+	 */
+	struct spmc __arena *volatile spmc;
+	int ret, i;
+
+	spmc = arena_malloc(sizeof(*spmc));
+	if (!spmc)
+		return 0;
+
+	spmc->bottom = 0;
+	spmc->top = 0;
+
+	bpf_for(i, 0, SPMC_ARR_ORDERS) {
+		spmc->arr[i].data = NULL;
+		spmc->arr[i].order = i;
+	}
+
+	ret = spmc_order_init((struct spmc __arena *)spmc, 0);
+	if (ret) {
+		arena_free(spmc);
+		return 0;
+	}
+
+	spmc->cur = &spmc->arr[0];
+
+	return (u64)(struct spmc __arena *)spmc;
+}
+
+__weak
+int spmc_destroy(struct spmc __arena *spmc __arg_arena)
+{
+	int i;
+
+	if (unlikely(!spmc))
+		return -EINVAL;
+
+	bpf_for(i, 0, SPMC_ARR_ORDERS)
+		arena_free(spmc->arr[i].data);
+
+	arena_free(spmc);
+
+	return 0;
+}

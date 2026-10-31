@@ -1,0 +1,723 @@
+//! Shared fixtures for per-module `#[cfg(test)]` blocks.
+//!
+//! This file is compiled only under `#[cfg(test)]`. Each fixture
+//! lives here because it is used by two or more submodule test
+//! blocks; single-use helpers stay co-located with their sole
+//! consumer.
+//!
+//! Nothing in this module is exposed outside the crate — all items
+//! are `pub(crate)` and the module itself is `#[cfg(test)]` so they
+//! disappear from non-test builds entirely.
+
+#![cfg(test)]
+
+use std::ffi::{OsStr, OsString};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+use anyhow::Result;
+use tempfile::TempDir;
+
+use crate::assert::{AssertDetail, AssertResult, ScenarioStats};
+use crate::scenario::Ctx;
+use crate::sync::MutexExt;
+use crate::vmm::topology::Topology;
+
+use super::entry::{KtstrTestEntry, Scheduler, SchedulerSpec, TopologyConstraints};
+
+/// Serializes tests that mutate env vars. Shared across every
+/// `#[cfg(test)]` module in the crate: nextest runs tests in
+/// parallel within a binary, and `std::env::set_var` is process-wide,
+/// so any test that mutates an env var must hold this mutex for its
+/// full save/mutate/restore window.
+pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Lock [`ENV_LOCK`] for the lifetime of a test, recovering from
+/// poisoning. If a previous test panicked while holding the lock we
+/// still want the current test to run: env-touching tests establish
+/// no shared invariant beyond their own save/restore pair, so the
+/// poisoned inner guard is safe to take.
+pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock_unpoisoned()
+}
+
+/// Tempdir bound as the process-wide `KTSTR_CACHE_DIR`. While the
+/// returned value is live:
+///   * the temp directory exists on disk and is pointed at by
+///     `KTSTR_CACHE_DIR`;
+///   * on drop, the env var's previous value is restored and the
+///     directory is removed.
+///
+/// Field order is load-bearing: Rust drops fields in declaration
+/// order, so `_guard` drops first (restoring `KTSTR_CACHE_DIR` to
+/// whatever the test process saw before construction) and `tmp`
+/// drops second (removing the directory). Reversing the order
+/// would leave `KTSTR_CACHE_DIR` pointing at a deleted tempdir
+/// during the window between `tmp`'s and `_guard`'s drop calls —
+/// a dangling-env-ref hazard in any code that races with the
+/// tail of the drop sequence.
+///
+/// Callers that also mutate other env vars must hold [`lock_env`]
+/// for the guard's full lifetime so the save/restore pair does not
+/// race with another test in the same binary.
+pub(crate) struct IsolatedCacheDir {
+    _guard: EnvVarGuard,
+    tmp: TempDir,
+}
+
+impl IsolatedCacheDir {
+    /// The temp directory's root path.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.tmp.path()
+    }
+}
+
+/// Create a fresh tempdir and point `KTSTR_CACHE_DIR` at it. See
+/// [`IsolatedCacheDir`] for drop semantics.
+pub(crate) fn isolated_cache_dir() -> IsolatedCacheDir {
+    let tmp = TempDir::new().expect("tempdir for isolated cache root");
+    let guard = EnvVarGuard::set(crate::KTSTR_CACHE_DIR_ENV, tmp.path());
+    IsolatedCacheDir { _guard: guard, tmp }
+}
+
+/// True when `dir` resolves to a discoverable git repository
+/// via `gix::discover`'s upward walk. Useful for tests that
+/// need to distinguish "the operator pointed at a non-git
+/// tree" (where `gix::discover` returns Err) from "the
+/// operator's tempdir happens to be inside a host git checkout
+/// (e.g. `/tmp` under a developer's `~/work`)" — `gix::discover`
+/// walks parents unconditionally and finds the ancestor `.git`
+/// in the second case.
+///
+/// Production code is fine with the upward-walk semantics —
+/// an operator who points `--source` at a tempdir genuinely
+/// inside their checkout DOES want the checkout's HEAD as the
+/// source identity. The semantic only breaks for tests that
+/// MUST exercise the no-repo-found branch; those tests call
+/// this helper and skip when the host environment cannot
+/// provide isolation. The non-fatal skip is the right call:
+/// the production behavior is correct in both cases, the test
+/// is the artifact that cares about the ancestor-`.git`
+/// outcome.
+pub(crate) fn tempdir_resolves_to_ancestor_git(dir: &std::path::Path) -> bool {
+    gix::discover(dir).is_ok()
+}
+
+/// Shared `Topology` used by `evaluate_vm_result` tests: the
+/// 1-numa-1-llc-2-core-1-thread topology is unremarkable on every
+/// dimension monitor checks touch, so tests that exercise other
+/// fields don't also have to reason about topology effects.
+pub(crate) const EVAL_TOPO: Topology = Topology::new(1, 1, 2, 1);
+
+/// Placeholder test function used by `eevdf_entry` / `sched_entry`
+/// fixtures. Always returns pass — tests that care about the
+/// function's behaviour construct their own `KtstrTestEntry.func`.
+pub(crate) fn dummy_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+
+/// RAII guard that mutates an environment variable and restores the
+/// original value on drop. Not thread-safe: hold [`ENV_LOCK`] for the
+/// guard's full lifetime when another test in the same binary might
+/// mutate the same key.
+///
+/// nextest runs each test in its own process, so simple single-variable
+/// tests don't need the lock — the lock is only needed when multiple
+/// tests in a single process mutate overlapping keys.
+///
+/// Keys and saved originals are stored as [`OsString`] so callers
+/// can pass `Path`, `PathBuf`, `&OsStr`, or `&str` without a UTF-8
+/// bridge — `&str: AsRef<OsStr>` keeps existing string-literal call
+/// sites working unchanged. Storage is `OsString` because non-UTF-8
+/// env values are valid on Unix and the guard must restore them
+/// exactly.
+///
+/// Shared across cache / remote_cache / anywhere else that needs to
+/// rewrite HOME / XDG_CACHE_HOME / KTSTR_CACHE_DIR / ACTIONS_CACHE_URL
+/// and friends during a test run. Previously duplicated in
+/// `cache::tests` and `remote_cache::tests`.
+pub(crate) struct EnvVarGuard {
+    key: OsString,
+    original: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    pub(crate) fn set(key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        let key = key.as_ref().to_owned();
+        let original = std::env::var_os(&key);
+        // SAFETY: nextest runs each test in its own process; callers
+        // that share a key across concurrent tests in the same process
+        // must call `lock_env()` before constructing the guard.
+        unsafe { std::env::set_var(&key, value) };
+        EnvVarGuard { key, original }
+    }
+
+    pub(crate) fn remove(key: impl AsRef<OsStr>) -> Self {
+        let key = key.as_ref().to_owned();
+        let original = std::env::var_os(&key);
+        // SAFETY: same rationale as `set`.
+        unsafe { std::env::remove_var(&key) };
+        EnvVarGuard { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            // SAFETY: nextest runs each test in its own process.
+            Some(val) => unsafe { std::env::set_var(&self.key, val) },
+            None => unsafe { std::env::remove_var(&self.key) },
+        }
+    }
+}
+
+/// Build a minimal `KtstrTestEntry` bound to the EEVDF scheduler.
+/// Intended for `evaluate_vm_result` tests that exercise the no-scx
+/// code path — see the `sched_entry` sibling for the scx variant.
+pub(crate) fn eevdf_entry(name: &'static str) -> KtstrTestEntry {
+    KtstrTestEntry {
+        name,
+        func: dummy_test_fn,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    }
+}
+
+/// Scheduler used by `sched_entry` to represent a generic scx-style
+/// scheduler for evaluate_vm_result tests that need the
+/// `has_active_scheduling == true` path.
+pub(crate) static SCHED_TEST: Scheduler = Scheduler {
+    name: "test_sched",
+    binary: SchedulerSpec::Discover("test_sched_bin"),
+    sysctls: &[],
+    kargs: &[],
+    assert: crate::assert::Assert::NO_OVERRIDES,
+    cgroup_parent: None,
+    sched_args: &[],
+    topology: Topology {
+        llcs: 1,
+        cores_per_llc: 2,
+        threads_per_core: 1,
+        numa_nodes: 1,
+        nodes: None,
+        distances: None,
+    },
+    constraints: TopologyConstraints::DEFAULT,
+    config_file: None,
+    config_file_def: None,
+    kernels: &[],
+};
+
+/// Build a minimal `KtstrTestEntry` bound to the scx-style
+/// `SCHED_TEST` fixture. Pair to `eevdf_entry` for the scheduler
+/// path in evaluate_vm_result tests.
+pub(crate) fn sched_entry(name: &'static str) -> KtstrTestEntry {
+    KtstrTestEntry {
+        name,
+        func: dummy_test_fn,
+        scheduler: &SCHED_TEST,
+        auto_repro: false,
+        ..KtstrTestEntry::DEFAULT
+    }
+}
+
+/// No-op repro probe: returns `None` so evaluate_vm_result tests
+/// don't attempt to spawn a second VM while running outside a kernel
+/// context.
+pub(crate) fn no_repro(_output: &str) -> Option<String> {
+    None
+}
+
+/// Construct a `VmResult` with explicit output/stderr/exit and
+/// default monitor/stimulus/verifier/kvm/crash fields. Used by
+/// evaluate_vm_result tests to drive specific error paths without
+/// touching an actual VM.
+pub(crate) fn make_vm_result(
+    output: &str,
+    stderr: &str,
+    exit_code: i32,
+    timed_out: bool,
+) -> crate::vmm::VmResult {
+    crate::vmm::VmResult {
+        success: !timed_out && exit_code == 0,
+        vcpus: 1,
+        cpu_budget: 1,
+        expect_auto_repro_satisfied: false,
+        exit_code,
+        duration: std::time::Duration::from_secs(1),
+        timed_out,
+        output: output.to_string(),
+        stderr: stderr.to_string(),
+        monitor: None,
+        guest_messages: None,
+        verifier_stats: Vec::new(),
+        kvm_stats: None,
+        crash_message: None,
+        cleanup_duration: None,
+        virtio_blk_counters: None,
+        virtio_net_counters: None,
+        snapshot_bridge: {
+            let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
+            crate::scenario::snapshot::SnapshotBridge::new(cb)
+        },
+        stats_client: None,
+        periodic_fired: 0,
+        periodic_real: 0,
+        periodic_target: 0,
+        kern_kaslr_offset: 0,
+        entry_name: None,
+        periodic_series_cache: std::sync::OnceLock::new(),
+    }
+}
+
+/// Build an [`AssertResult`] with a default (all-zero)
+/// [`ScenarioStats`] payload. Centralizes the 16-field zero-stats
+/// skeleton that previously had to be hand-typed at every
+/// `evaluate_vm_result` call site.
+///
+/// Pre-bulk-port migration: every call site used to wrap this
+/// in `serde_json::to_string` and embed the JSON between
+/// `RESULT_START` / `RESULT_END` delimiters in `output`. The
+/// fallback decoder is gone — call sites now build the full
+/// [`crate::vmm::host_comms::BulkDrainResult`] via
+/// [`make_vm_result_with_assert`] (or hand-roll a `BulkDrainResult`
+/// when they need extra entries beyond the test result).
+pub(crate) fn build_assert_result(passed: bool, details: Vec<AssertDetail>) -> AssertResult {
+    let outcomes = if passed && details.is_empty() {
+        vec![]
+    } else if passed {
+        // Passing result with details — treat the details as
+        // info_notes shape via Skip variants (rare; tests use this).
+        details
+            .into_iter()
+            .map(crate::assert::Outcome::Skip)
+            .collect()
+    } else {
+        // Failing result — wrap each detail in a Fail outcome.
+        details
+            .into_iter()
+            .map(crate::assert::Outcome::Fail)
+            .collect()
+    };
+    AssertResult {
+        outcomes,
+        passes: vec![],
+        stats: ScenarioStats::default(),
+        measurements: std::collections::BTreeMap::new(),
+        info_notes: vec![],
+    }
+}
+
+/// Frame an [`AssertResult`] as a postcard-encoded
+/// `MSG_TYPE_TEST_RESULT` TLV entry, ready to drop into
+/// [`crate::vmm::host_comms::BulkDrainResult::entries`].
+///
+/// Mirrors what the guest's
+/// [`crate::vmm::guest_comms::send_test_result`] writes onto the
+/// wire (modulo the framing header — `BulkDrainResult` carries
+/// already-parsed entries, not raw bytes), so a test fixture's
+/// entry round-trips through `parse_assert_result_from_drain`'s
+/// `postcard::from_bytes` exactly as a real guest
+/// emission would.
+pub(crate) fn assert_result_tlv_entry(result: &AssertResult) -> crate::vmm::wire::ShmEntry {
+    let payload = postcard::to_stdvec(result).expect("AssertResult postcard encode must not fail");
+    crate::vmm::wire::ShmEntry {
+        msg_type: crate::vmm::wire::MSG_TYPE_TEST_RESULT,
+        payload,
+        crc_ok: true,
+    }
+}
+
+/// Construct a [`crate::vmm::VmResult`] whose `guest_messages`
+/// carries a single postcard-encoded `MSG_TYPE_TEST_RESULT` TLV
+/// entry produced from `assert`. Otherwise identical to
+/// [`make_vm_result`]; the explicit `output` / `stderr` / `exit_code`
+/// / `timed_out` arguments still drive the COM2-style fields the
+/// host-side panic / sched-log scrapers consume.
+pub(crate) fn make_vm_result_with_assert(
+    output: &str,
+    stderr: &str,
+    exit_code: i32,
+    timed_out: bool,
+    assert: &AssertResult,
+) -> crate::vmm::VmResult {
+    let mut r = make_vm_result(output, stderr, exit_code, timed_out);
+    r.guest_messages = Some(crate::vmm::host_comms::BulkDrainResult {
+        entries: vec![assert_result_tlv_entry(assert)],
+    });
+    r
+}
+
+/// Build a [`crate::vmm::host_comms::BulkDrainResult`] that carries
+/// only `MSG_TYPE_LIFECYCLE` entries — one per supplied
+/// [`crate::vmm::wire::LifecyclePhase`], in arrival order. Each entry
+/// has a single-byte payload (the phase wire value) and `crc_ok: true`.
+///
+/// Mirrors the guest-side
+/// [`crate::vmm::guest_comms::send_lifecycle`] frame layout for
+/// every phase whose payload is the bare 1-byte discriminant
+/// (`InitStarted`, `PayloadStarting`, `SchedulerDied`); the
+/// `SchedulerNotAttached` reason suffix is not modelled here because
+/// none of the current `evaluate_vm_result` / `classify_init_stage`
+/// call sites need it.
+pub(crate) fn lifecycle_drain(
+    phases: &[crate::vmm::wire::LifecyclePhase],
+) -> crate::vmm::host_comms::BulkDrainResult {
+    let entries = phases
+        .iter()
+        .map(|p| crate::vmm::wire::ShmEntry {
+            msg_type: crate::vmm::wire::MSG_TYPE_LIFECYCLE,
+            payload: vec![p.wire_value()],
+            crc_ok: true,
+        })
+        .collect();
+    crate::vmm::host_comms::BulkDrainResult { entries }
+}
+
+/// Build a `KtstrTestEntry` with overridden memory/duration for
+/// `KtstrTestEntry::validate` tests. Everything else inherits from
+/// `DEFAULT`.
+pub(crate) fn validate_entry(
+    name: &'static str,
+    memory_mib: u32,
+    duration: Duration,
+) -> KtstrTestEntry {
+    KtstrTestEntry {
+        name,
+        memory_mib,
+        duration,
+        ..KtstrTestEntry::DEFAULT
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Panic payload extraction
+// ---------------------------------------------------------------------------
+
+/// Convert a `catch_unwind` / `JoinHandle::join` panic payload into a
+/// human-readable string, preserving whatever message the panic
+/// actually carried.
+///
+/// The panic payload from `std::panic::catch_unwind` is
+/// `Box<dyn Any + Send>`. The two common cases — `&'static str`
+/// (from `panic!("literal")`) and `String` (from `panic!("{x}")` /
+/// `panic!("{}", msg)`) — require explicit downcast; without them
+/// the test-side diagnostic collapses to the useless "Box<Any>"
+/// rendering that `panic_any` fall-through produces. A payload
+/// carrying some other type drops to a `{:?}` rendering via the
+/// `Box<dyn Any>` itself, which at least lets a reader see the
+/// payload's type name.
+///
+/// Ladder (matches the de facto std-library convention used by
+/// `Mutex::unwrap_or_else`, `rayon::scope`'s panic diagnostics,
+/// etc.):
+///
+/// 1. `payload.downcast_ref::<&'static str>()` — covers
+///    `panic!("literal")`.
+/// 2. `payload.downcast_ref::<String>()` — covers
+///    `panic!("{x}")` / `panic!("formatted: {}", y)`.
+/// 3. Fallback: `format!("{payload:?}")` — any other payload type
+///    renders via its `Debug` impl (or the `Box<dyn Any>` Debug
+///    impl, which prints `Any { .. }`).
+pub(crate) fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        format!("{payload:?}")
+    }
+}
+
+#[cfg(test)]
+mod panic_payload_tests {
+    use super::panic_payload_to_string;
+
+    /// `panic!("str-literal")` panics with a `&'static str` payload.
+    /// The helper must recover the literal exactly.
+    ///
+    /// `#[cfg(panic = "unwind")]`: the test deliberately panics
+    /// inside `std::panic::catch_unwind` to exercise the payload
+    /// recovery helper. Under `panic = "abort"` (release profile —
+    /// see `Cargo.toml [profile.release]`) panics cannot be caught;
+    /// the panic aborts the whole test binary instead of returning
+    /// an `Err` from `catch_unwind`. Gating the test on the panic
+    /// strategy lets `cargo ktstr test --release` skip it cleanly.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn panic_payload_str_literal_recovered() {
+        let result = std::panic::catch_unwind(|| {
+            panic!("a-string-literal");
+        });
+        let payload = result.expect_err("closure must panic");
+        assert_eq!(panic_payload_to_string(payload), "a-string-literal");
+    }
+
+    /// `panic!("{x}")` with a formatted arg panics with a `String`
+    /// payload. The helper must preserve the FORMATTED text, not
+    /// drop back to a `Box<dyn Any>` stringification.
+    ///
+    /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
+    /// `panic_payload_str_literal_recovered` test — `catch_unwind`
+    /// is unusable under `panic = "abort"`.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn panic_payload_formatted_string_recovered() {
+        let n: u32 = 42;
+        let result = std::panic::catch_unwind(|| {
+            panic!("formatted-{n}-panic");
+        });
+        let payload = result.expect_err("closure must panic");
+        assert_eq!(panic_payload_to_string(payload), "formatted-42-panic");
+    }
+
+    /// A non-string payload (e.g. a numeric value via `panic_any`)
+    /// drops to the `Debug` fallback rather than panicking the
+    /// helper itself. The exact rendering is not pinned beyond a
+    /// non-empty string — the contract is "never panic, always
+    /// return SOMETHING useful".
+    ///
+    /// `#[cfg(panic = "unwind")]`: same rationale as the sibling
+    /// `panic_payload_str_literal_recovered` test — `catch_unwind`
+    /// is unusable under `panic = "abort"`.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn panic_payload_non_string_falls_back_to_debug() {
+        let result = std::panic::catch_unwind(|| {
+            std::panic::panic_any(127i32);
+        });
+        let payload = result.expect_err("closure must panic");
+        let rendered = panic_payload_to_string(payload);
+        assert!(
+            !rendered.is_empty(),
+            "non-string payload must render to SOMETHING (non-empty)",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EnvVarGuard drop-time restoration tests
+// ---------------------------------------------------------------------------
+//
+// Each test uses a distinct env var name so even when `lock_env()` is
+// not held across the full set, the tests don't clobber each other's
+// pre-existing values. `lock_env()` still serializes against any other
+// env-touching test in the crate so the save/mutate/restore window
+// does not race with `HOME` / `XDG_CACHE_HOME` / `KTSTR_CACHE_DIR`
+// rewrites in cache / model / sidecar tests.
+
+/// `EnvVarGuard::set` restores the PRE-EXISTING value of the key
+/// when the guard drops. Pre-seed the key to a known sentinel,
+/// construct a guard that overwrites it, confirm the overwrite is
+/// visible, drop the guard, and re-read: the sentinel must be back.
+#[test]
+fn env_var_guard_set_restores_original_value_on_drop() {
+    const KEY: &str = "KTSTR_TEST_ENV_VAR_GUARD_SET_RESTORES_ORIGINAL";
+    let _lock = lock_env();
+    // SAFETY: process-wide env mutation; we hold `lock_env()` so no
+    // other test in this binary is racing a key mutation.
+    unsafe { std::env::set_var(KEY, "pre-existing") };
+    {
+        let _g = EnvVarGuard::set(KEY, "overwritten");
+        assert_eq!(std::env::var(KEY).ok().as_deref(), Some("overwritten"));
+    }
+    assert_eq!(
+        std::env::var(KEY).ok().as_deref(),
+        Some("pre-existing"),
+        "EnvVarGuard::set must restore the pre-existing value on drop"
+    );
+    // Cleanup so a subsequent test run doesn't inherit our sentinel.
+    unsafe { std::env::remove_var(KEY) };
+}
+
+/// `EnvVarGuard::set` on a key that is currently absent restores it
+/// to absent on drop — the guard remembered `None`, so dropping must
+/// `remove_var` rather than re-`set_var` the string `"None"` or a
+/// stale previous value.
+#[test]
+fn env_var_guard_set_restores_absent_key_on_drop() {
+    const KEY: &str = "KTSTR_TEST_ENV_VAR_GUARD_SET_RESTORES_ABSENT";
+    let _lock = lock_env();
+    // Guarantee the key is absent before the guard fires.
+    unsafe { std::env::remove_var(KEY) };
+    assert!(std::env::var(KEY).is_err(), "setup: key must start absent");
+    {
+        let _g = EnvVarGuard::set(KEY, "transient");
+        assert_eq!(std::env::var(KEY).ok().as_deref(), Some("transient"));
+    }
+    assert!(
+        std::env::var(KEY).is_err(),
+        "EnvVarGuard::set on an absent key must restore absence, not leave the value behind"
+    );
+}
+
+/// `EnvVarGuard::remove` preserves the PRE-EXISTING value across its
+/// lifetime: the guard takes the key out of the environment while
+/// alive, then puts the original back on drop.
+#[test]
+fn env_var_guard_remove_restores_original_value_on_drop() {
+    const KEY: &str = "KTSTR_TEST_ENV_VAR_GUARD_REMOVE_RESTORES_ORIGINAL";
+    let _lock = lock_env();
+    unsafe { std::env::set_var(KEY, "pre-existing") };
+    {
+        let _g = EnvVarGuard::remove(KEY);
+        assert!(
+            std::env::var(KEY).is_err(),
+            "EnvVarGuard::remove must remove the key for the guard's lifetime"
+        );
+    }
+    assert_eq!(
+        std::env::var(KEY).ok().as_deref(),
+        Some("pre-existing"),
+        "EnvVarGuard::remove must restore the pre-existing value on drop"
+    );
+    unsafe { std::env::remove_var(KEY) };
+}
+
+/// Non-UTF-8 env values are valid on Unix, and the guard's
+/// [`OsString`] storage must round-trip them exactly. If storage
+/// had been kept as `String` or the read had used `std::env::var`
+/// (which rejects non-UTF-8), a pre-existing non-UTF-8 original
+/// would be silently converted into absence or lossily decoded —
+/// and the drop-time restore would put back a *different* byte
+/// sequence than what the test environment originally held.
+#[cfg(unix)]
+#[test]
+fn env_var_guard_restores_non_utf8_original_exactly() {
+    use std::os::unix::ffi::OsStrExt;
+
+    const KEY: &str = "KTSTR_TEST_ENV_VAR_GUARD_RESTORES_NON_UTF8";
+    // A byte sequence with a lone 0xFF — not valid UTF-8.
+    let original_bytes: &[u8] = b"foo\xFFbar";
+    let original = OsStr::from_bytes(original_bytes);
+
+    let _lock = lock_env();
+    // SAFETY: process-wide env mutation; we hold `lock_env()`.
+    unsafe { std::env::set_var(KEY, original) };
+    {
+        let _g = EnvVarGuard::set(KEY, "replacement");
+        assert_eq!(
+            std::env::var_os(KEY).as_deref(),
+            Some(OsStr::new("replacement")),
+            "EnvVarGuard::set must overwrite the key while the guard is live",
+        );
+    }
+    let restored = std::env::var_os(KEY).expect("restored value must be present after drop");
+    assert_eq!(
+        restored.as_bytes(),
+        original_bytes,
+        "EnvVarGuard must restore non-UTF-8 originals byte-for-byte",
+    );
+    unsafe { std::env::remove_var(KEY) };
+}
+
+/// Process-wide mutex serializing every stderr-capture call across
+/// the crate. `fd 2 → tempfile` redirection is a non-reentrant
+/// process-global mutation — two concurrent callers in DIFFERENT
+/// modules would see each other's output land in their sink (or
+/// worse, the save/restore pair could interleave and permanently
+/// break fd 2). Before this lock existed, `src/cli.rs` and
+/// `src/report.rs` each had their own module-local mutex, which
+/// serialized within-module calls but did NOT coordinate across
+/// modules. The ONE mutex here guards every capture site in the
+/// crate.
+pub(crate) static STDERR_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard that restores the saved stderr fd on Drop, even if
+/// the captured closure panics under the `panic = "unwind"` test
+/// profile. Without this guard a panicking closure would leak the
+/// fd-2 swap and every subsequent stderr write in the test process
+/// would land in the orphaned tempfile. `saved` is `Option` so Drop
+/// can `take()` and consume it without an `&mut` borrow fight.
+pub(crate) struct StderrRestoreGuard {
+    saved: Option<std::os::fd::OwnedFd>,
+}
+impl Drop for StderrRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            let _ = nix::unistd::dup2_stderr(&saved);
+        }
+    }
+}
+
+/// Run `f` with stderr redirected to an in-memory tempfile; return
+/// both `f`'s value and the captured bytes. Uses the process-wide
+/// [`STDERR_CAPTURE_LOCK`] to serialize against every other capture
+/// call in the crate. The RAII [`StderrRestoreGuard`] restores fd 2
+/// even if `f` panics under `panic = "unwind"`.
+pub(crate) fn capture_stderr<R>(f: impl FnOnce() -> R) -> (R, Vec<u8>) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let _lock = STDERR_CAPTURE_LOCK.lock_unpoisoned();
+    let mut sink = tempfile::tempfile().expect("create stderr-capture tempfile");
+    // Flush before redirect: eprintln! is line-buffered behind the
+    // Stderr lock; pre-call bytes need to reach the ORIGINAL fd 2
+    // or they leak into the captured tempfile.
+    std::io::stderr().flush().ok();
+    let saved = nix::unistd::dup(std::io::stderr()).expect("dup(stderr)");
+    nix::unistd::dup2_stderr(&sink).expect("dup2_stderr(sink)");
+    let guard = StderrRestoreGuard { saved: Some(saved) };
+    let result = f();
+    std::io::stderr().flush().ok();
+    drop(guard);
+    sink.seek(SeekFrom::Start(0)).expect("rewind sink");
+    let mut bytes = Vec::new();
+    sink.read_to_end(&mut bytes).expect("read sink");
+    (result, bytes)
+}
+
+/// Concurrent capture-stderr calls MUST observe only their own
+/// emitted bytes. Without [`STDERR_CAPTURE_LOCK`] the two threads'
+/// `fd 2 → tempfile` swaps would race: thread A's
+/// `dup2_stderr(sink_a)` followed by thread B's `dup2_stderr(sink_b)`
+/// would leave A's `eprintln!` output in B's sink and vice versa,
+/// and the subsequent `dup2_stderr(saved)` restores could leave fd 2
+/// permanently pointing at a stale tempfile. Either outcome would
+/// permanently break every subsequent stderr write in the test
+/// process.
+///
+/// This test spawns N threads that each emit a unique marker,
+/// capture, and assert their marker is present AND no OTHER
+/// thread's marker leaked in. Under a broken or absent lock this
+/// fails almost immediately on a multi-core host; under the
+/// present lock the N captures serialize and every thread sees
+/// only its own bytes.
+#[test]
+fn capture_stderr_serializes_concurrent_callers() {
+    const N: usize = 8;
+    let markers: Vec<String> = (0..N)
+        .map(|i| format!("KTSTR_CAPTURE_LOCK_MARKER_{i:03}"))
+        .collect();
+    let handles: Vec<std::thread::JoinHandle<(usize, Vec<u8>)>> = (0..N)
+        .map(|i| {
+            let mine = markers[i].clone();
+            let others: Vec<String> = markers
+                .iter()
+                .enumerate()
+                .filter(|&(j, _m)| j != i)
+                .map(|(_j, m)| m.clone())
+                .collect();
+            std::thread::spawn(move || {
+                let (_, bytes) = capture_stderr(|| {
+                    eprintln!("{mine}");
+                });
+                let captured = String::from_utf8_lossy(&bytes);
+                assert!(
+                    captured.contains(&mine),
+                    "thread {i}: own marker missing from captured output: {captured:?}",
+                );
+                for other in &others {
+                    assert!(
+                        !captured.contains(other.as_str()),
+                        "thread {i}: foreign marker '{other}' leaked into captured \
+                         output — STDERR_CAPTURE_LOCK failed to serialize \
+                         concurrent callers: {captured:?}",
+                    );
+                }
+                (i, bytes)
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("capture thread panicked");
+    }
+}
